@@ -216,13 +216,13 @@ class TestPromptCache(unittest.TestCase):
         num_trimmed = trim_prompt_cache(cache, 4)
         self.assertEqual(num_trimmed, 3)
 
-        # Can't trim arrays cache
+        # ArraysCache is trimmable (no-op trim for static features)
         cache = [ArraysCache(size=2) for _ in range(2)]
         for c in cache:
             c[0] = mx.zeros((5, 5))
             c[1] = mx.zeros((5, 5))
         num_trimmed = trim_prompt_cache(cache, 7)
-        self.assertEqual(num_trimmed, 0)
+        self.assertEqual(num_trimmed, 7)
 
         # All cache's have to be trimmable
         cache = [ArraysCache(size=2), KVCache()]
@@ -231,7 +231,7 @@ class TestPromptCache(unittest.TestCase):
         x = mx.random.uniform(shape=(1, 8, 10, 4))
         cache[1].update_and_fetch(x, x)
         num_trimmed = trim_prompt_cache(cache, 1)
-        self.assertEqual(num_trimmed, 0)
+        self.assertEqual(num_trimmed, 1)
 
         cache = [RotatingKVCache(max_size=6) for _ in range(2)]
         for c in cache:
@@ -375,7 +375,7 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(m, 5)
 
         c = CacheList(ArraysCache(size=2), KVCache())
-        self.assertFalse(c.is_trimmable())
+        self.assertTrue(c.is_trimmable())
 
         c1 = CacheList(ArraysCache(size=1), KVCache())
         c1[0][0] = mx.random.normal(shape=(1, 2, 4, 4))
