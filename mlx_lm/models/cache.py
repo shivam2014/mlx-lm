@@ -1087,6 +1087,14 @@ class ArraysCache(_BaseCache):
                 cache[e][i : i + 1] = caches[i][e]
         return cache
 
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        # ArraysCache stores static per-layer image features with no
+        # token-position offset to rewind. Report success without mutation.
+        return n
+
     def empty(self):
         return self.cache[0] is None
 
