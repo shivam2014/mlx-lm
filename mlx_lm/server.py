@@ -1053,7 +1053,14 @@ class ResponseGenerator:
                         tokens_to_trim = len(cache_key) - current_idx
                         if tokens_to_trim > 0:
                             for c in intermediate_cache:
-                                if hasattr(c, "trim"):
+                                if not hasattr(c, "trim"):
+                                    logging.error(
+                                        f"Cache element {type(c).__name__} missing trim() "
+                                        "method — intermediate cache will contain excess "
+                                        "tokens beyond segment boundary. Generation quality "
+                                        "may be affected."
+                                    )
+                                else:
                                     c.trim(tokens_to_trim)
 
                         self.prompt_cache.insert_cache(
