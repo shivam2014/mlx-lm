@@ -683,6 +683,8 @@ class ResponseGenerator:
         return sm, sequences
 
     def _is_batchable(self, args):
+        if getattr(self.cli_args, "kv_bits", None) is not None:
+            return False
         return self.model_provider.is_batchable and args.seed is None
 
     def _generate(self):
@@ -973,6 +975,16 @@ class ResponseGenerator:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
+            kv_kwargs = {}
+            if getattr(self.cli_args, "kv_bits", None) is not None:
+                kv_kwargs["kv_bits"] = self.cli_args.kv_bits
+                kv_kwargs["kv_group_size"] = self.cli_args.kv_group_size
+                kv_kwargs["quantized_kv_start"] = self.cli_args.quantized_kv_start
+
+            # Ensure MLX has a default Metal stream for this thread
+            # (required before any MLX operation; avoids "no Stream in current thread" errors)
+            mx.default_stream(mx.default_device())
+
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -985,6 +997,7 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                **kv_kwargs,
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
@@ -1453,7 +1466,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         try:
             for gen in response:
-                logging.debug(gen.text)
+                # logging.debug(gen.text)  # muted: per-token debug spam
 
                 # Collect the text according to our current state and state
                 # transitions. Reasoning or tool or normal text.
@@ -1867,6 +1880,24 @@ def main():
         type=int,
         default=2048,
         help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=lambda s: eval(s) if s.startswith("(") else int(s),
+        default=None,
+        help="Number of bits for KV cache quantization (int or tuple '(k,v)' for KVSplit). None means no quantization.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=lambda s: eval(s) if s.startswith("(") else int(s),
+        default=64,
+        help="Group size for KV cache quantization (int or tuple '(k,v)' for KVSplit, default: 64)",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=0,
+        help="Step to begin quantizing the KV cache (default: 0)",
     )
     parser.add_argument(
         "--prompt-cache-size",
