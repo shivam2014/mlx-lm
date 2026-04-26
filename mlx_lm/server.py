@@ -598,6 +598,9 @@ class ResponseGenerator:
                 if a != b:
                     sys_end = i
                     break
+            else:
+                if len(sys_tokens) <= len(prompt):
+                    sys_end = len(sys_tokens)
             if sys_end > 0 and sys_end < len(prompt):
                 segments.append(prompt[:sys_end])
                 segment_types.append("system")
@@ -935,7 +938,7 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt and state machine
-            prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+            prompt, segments, segment_types, initial_state = self._tokenize(tokenizer, request, args)
             sm, sequences = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
@@ -1028,10 +1031,40 @@ class ResponseGenerator:
 
             rqueue.put(None)
 
-            # Save the KV cache again
-            self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
-            )
+            # --- PATCH: Segment-Aware Caching for _serve_single ---
+            # If KV quantization disables batching, we must manually save
+            # intermediate caches (e.g. 'system') to prevent full recomputes.
+
+            current_idx = 0
+            for i, (seg_tokens, seg_type) in enumerate(zip(segments, segment_types)):
+                current_idx += len(seg_tokens)
+
+                # The final sequence (Prompt + Generated text) is always cached as "assistant"
+                if i == len(segments) - 1:
+                    self.prompt_cache.insert_cache(
+                        self.model_provider.model_key, cache_key, cache, cache_type="assistant"
+                    )
+                else:
+                    # For intermediate chunks (like the 28k "system" prompt), we duplicate
+                    # the cache and trim off the tokens that came after this boundary.
+                    try:
+                        import copy
+                        intermediate_cache = [copy.copy(c) for c in cache]
+                        tokens_to_trim = len(cache_key) - current_idx
+                        if tokens_to_trim > 0:
+                            for c in intermediate_cache:
+                                if hasattr(c, "trim"):
+                                    c.trim(tokens_to_trim)
+
+                        self.prompt_cache.insert_cache(
+                            self.model_provider.model_key,
+                            cache_key[:current_idx],
+                            intermediate_cache,
+                            cache_type=seg_type,
+                        )
+                    except Exception as e:
+                        logging.warning(f"Failed to extract intermediate {seg_type} cache: {e}")
+
 
         except Exception as e:
             rqueue.put(e)
