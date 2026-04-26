@@ -4,7 +4,6 @@ import argparse
 import json
 import logging
 import pickle
-import copy
 import platform
 import socket
 import time
@@ -1049,11 +1048,13 @@ class ResponseGenerator:
                     # For intermediate chunks (like the 28k "system" prompt), we duplicate
                     # the cache and trim off the tokens that came after this boundary.
                     try:
+                        import copy
                         intermediate_cache = [copy.copy(c) for c in cache]
                         tokens_to_trim = len(cache_key) - current_idx
                         if tokens_to_trim > 0:
                             for c in intermediate_cache:
-                                c.trim(tokens_to_trim)
+                                if hasattr(c, "trim"):
+                                    c.trim(tokens_to_trim)
 
                         self.prompt_cache.insert_cache(
                             self.model_provider.model_key,
