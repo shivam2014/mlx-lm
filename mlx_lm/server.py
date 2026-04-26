@@ -297,6 +297,7 @@ class ModelProvider:
         self.model = None
         self.tokenizer = None
         self.draft_model = None
+        self.specprefill_model = None
         self.is_batchable = False
 
         group = mx.distributed.init()
@@ -366,6 +367,10 @@ class ModelProvider:
                     "Draft model tokenizer does not match model tokenizer. "
                     "Speculative decoding may not work as expected."
                 )
+
+        # Load specprefill model if specified
+        if self.cli_args.specprefill_model is not None:
+            self.specprefill_model, _ = load(self.cli_args.specprefill_model)
 
         # Compute batchability
         is_batchable = draft_model is None
@@ -984,6 +989,15 @@ class ResponseGenerator:
                 kv_kwargs["kv_group_size"] = self.cli_args.kv_group_size
                 kv_kwargs["quantized_kv_start"] = self.cli_args.quantized_kv_start
 
+            # Pass specprefill kwargs if speculator model is loaded
+            specprefill_kwargs = {}
+            if self.model_provider.specprefill_model is not None:
+                specprefill_kwargs["specprefill_model"] = self.model_provider.specprefill_model
+                specprefill_kwargs["specprefill_keep_pct"] = getattr(self.cli_args, "specprefill_keep_pct", 0.3)
+                specprefill_kwargs["specprefill_threshold"] = getattr(self.cli_args, "specprefill_threshold", 8192)
+                specprefill_kwargs["specprefill_lookahead"] = getattr(self.cli_args, "specprefill_lookahead", 8)
+                specprefill_kwargs["specprefill_pool_kernel"] = getattr(self.cli_args, "specprefill_pool_kernel", 13)
+
             # Ensure MLX has a default Metal stream for this thread
             # (required before any MLX operation; avoids "no Stream in current thread" errors)
             mx.default_stream(mx.default_device())
@@ -1001,6 +1015,7 @@ class ResponseGenerator:
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
                 **kv_kwargs,
+                **specprefill_kwargs,
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
@@ -1835,6 +1850,36 @@ def main():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--specprefill-model",
+        type=str,
+        help="A small model to use for SpecPrefill token importance scoring.",
+        default=None,
+    )
+    parser.add_argument(
+        "--specprefill-keep-pct",
+        type=float,
+        help="Fraction of prompt tokens to keep with SpecPrefill (default: 0.3)",
+        default=0.3,
+    )
+    parser.add_argument(
+        "--specprefill-threshold",
+        type=int,
+        help="Minimum prompt length to trigger SpecPrefill (default: 8192)",
+        default=8192,
+    )
+    parser.add_argument(
+        "--specprefill-lookahead",
+        type=int,
+        help="Number of lookahead decode steps for SpecPrefill scoring (default: 8)",
+        default=8,
+    )
+    parser.add_argument(
+        "--specprefill-pool-kernel",
+        type=int,
+        help="Pooling kernel size for attention score smoothing (default: 13)",
+        default=13,
     )
     parser.add_argument(
         "--trust-remote-code",

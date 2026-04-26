@@ -220,6 +220,36 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--specprefill-model",
+        type=str,
+        help="A small model to score token importance for SpecPrefill TTFT reduction.",
+        default=None,
+    )
+    parser.add_argument(
+        "--specprefill-keep-pct",
+        type=float,
+        help="Fraction of tokens to keep during SpecPrefill sparse prefill (0.0-1.0).",
+        default=0.3,
+    )
+    parser.add_argument(
+        "--specprefill-threshold",
+        type=int,
+        help="Minimum prompt length to trigger SpecPrefill.",
+        default=8192,
+    )
+    parser.add_argument(
+        "--specprefill-lookahead",
+        type=int,
+        help="Number of lookahead decode steps for SpecPrefill token scoring.",
+        default=8,
+    )
+    parser.add_argument(
+        "--specprefill-pool-kernel",
+        type=int,
+        help="Smoothing kernel size for SpecPrefill attention score pooling.",
+        default=13,
+    )
     return parser
 
 
@@ -320,6 +350,11 @@ def generate_step(
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
+    specprefill_model: Optional[nn.Module] = None,
+    specprefill_keep_pct: float = 0.3,
+    specprefill_threshold: int = 8192,
+    specprefill_lookahead: int = 8,
+    specprefill_pool_kernel: int = 13,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -428,30 +463,67 @@ def generate_step(
         )
         prompt_processed_tokens = 0
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
-        while total_prompt_tokens - prompt_processed_tokens > 1:
-            remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
-            n_to_process = min(prefill_step_size, remaining)
-            _model_call(
-                input_tokens=prompt[:n_to_process][None],
-                input_embeddings=(
-                    input_embeddings[:n_to_process][None]
-                    if input_embeddings is not None
-                    else None
-                ),
-            )
-            quantize_cache_fn(prompt_cache)
-            mx.eval([c.state for c in prompt_cache])
-            prompt_processed_tokens += n_to_process
-            prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
-            prompt = prompt[n_to_process:]
-            input_embeddings = (
-                input_embeddings[n_to_process:]
-                if input_embeddings is not None
-                else input_embeddings
-            )
-            mx.clear_cache()
 
-        y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+        use_specprefill = (
+            specprefill_model is not None
+            and total_prompt_tokens > specprefill_threshold
+            and input_embeddings is None
+        )
+
+        if use_specprefill:
+            from .specprefill import score_tokens, select_chunks, sparse_prefill
+
+            importance = score_tokens(
+                specprefill_model,
+                prompt,
+                n_lookahead=specprefill_lookahead,
+                pool_kernel=specprefill_pool_kernel,
+                prefill_step_size=prefill_step_size,
+            )
+            selected = select_chunks(importance, keep_pct=specprefill_keep_pct)
+            logits = sparse_prefill(
+                model,
+                prompt,
+                selected,
+                prompt_cache,
+                step_size=prefill_step_size,
+            )
+            logits = logits[:, -1, :]
+            if logits_processors and len(prompt) > 0:
+                tokens = prompt
+                for processor in logits_processors:
+                    logits = processor(tokens, logits)
+            quantize_cache_fn(prompt_cache)
+            logprobs_2d = logits - mx.logsumexp(logits, keepdims=True)
+            y = sampler(logprobs_2d)
+            logprobs = logprobs_2d.squeeze(0)
+            prompt_processed_tokens = total_prompt_tokens
+            prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+        else:
+            while total_prompt_tokens - prompt_processed_tokens > 1:
+                remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
+                n_to_process = min(prefill_step_size, remaining)
+                _model_call(
+                    input_tokens=prompt[:n_to_process][None],
+                    input_embeddings=(
+                        input_embeddings[:n_to_process][None]
+                        if input_embeddings is not None
+                        else None
+                    ),
+                )
+                quantize_cache_fn(prompt_cache)
+                mx.eval([c.state for c in prompt_cache])
+                prompt_processed_tokens += n_to_process
+                prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+                prompt = prompt[n_to_process:]
+                input_embeddings = (
+                    input_embeddings[n_to_process:]
+                    if input_embeddings is not None
+                    else input_embeddings
+                )
+                mx.clear_cache()
+
+            y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
 
     mx.async_eval(y, logprobs)
     n = 0
@@ -712,20 +784,36 @@ def stream_generate(
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
-    with wired_limit(model, [generation_stream]):
-        tic = time.perf_counter()
-        for n, (token, logprobs, from_draft) in enumerate(token_generator):
-            if n == 0:
-                prompt_time = time.perf_counter() - tic
-                prompt_tps = prompt.size / prompt_time
-                tic = time.perf_counter()
-            if token in tokenizer.eos_token_ids:
-                break
+    specprefill_model = kwargs.get("specprefill_model")
+    try:
+        with wired_limit(model, [generation_stream]):
+            tic = time.perf_counter()
+            for n, (token, logprobs, from_draft) in enumerate(token_generator):
+                if n == 0:
+                    prompt_time = time.perf_counter() - tic
+                    prompt_tps = prompt.size / prompt_time
+                    tic = time.perf_counter()
+                if token in tokenizer.eos_token_ids:
+                    break
 
-            detokenizer.add_token(token)
-            if (n + 1) == max_tokens:
-                break
+                detokenizer.add_token(token)
+                if (n + 1) == max_tokens:
+                    break
 
+                yield GenerationResponse(
+                    text=detokenizer.last_segment,
+                    token=token,
+                    logprobs=logprobs,
+                    from_draft=from_draft,
+                    prompt_tokens=prompt.size,
+                    prompt_tps=prompt_tps,
+                    generation_tokens=n + 1,
+                    generation_tps=(n + 1) / (time.perf_counter() - tic),
+                    peak_memory=mx.get_peak_memory() / 1e9,
+                    finish_reason=None,
+                )
+
+            detokenizer.finalize()
             yield GenerationResponse(
                 text=detokenizer.last_segment,
                 token=token,
@@ -736,22 +824,12 @@ def stream_generate(
                 generation_tokens=n + 1,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
-                finish_reason=None,
+                finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
             )
-
-        detokenizer.finalize()
-        yield GenerationResponse(
-            text=detokenizer.last_segment,
-            token=token,
-            logprobs=logprobs,
-            from_draft=from_draft,
-            prompt_tokens=prompt.size,
-            prompt_tps=prompt_tps,
-            generation_tokens=n + 1,
-            generation_tps=(n + 1) / (time.perf_counter() - tic),
-            peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
-        )
+    finally:
+        if specprefill_model is not None:
+            from .specprefill import cleanup_rope
+            cleanup_rope(model)
 
 
 def generate(
@@ -2060,6 +2138,15 @@ def main():
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:
         draft_model = None
+
+    if args.specprefill_model is not None:
+        specprefill_model, specprefill_tokenizer = load(args.specprefill_model)
+        if specprefill_tokenizer.vocab_size != tokenizer.vocab_size:
+            raise ValueError(
+                "SpecPrefill model tokenizer does not match model tokenizer."
+            )
+    else:
+        specprefill_model = None
     sampler = make_sampler(
         args.temp,
         args.top_p,
@@ -2084,6 +2171,11 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        specprefill_model=specprefill_model,
+        specprefill_keep_pct=args.specprefill_keep_pct,
+        specprefill_threshold=args.specprefill_threshold,
+        specprefill_lookahead=args.specprefill_lookahead,
+        specprefill_pool_kernel=args.specprefill_pool_kernel,
     )
     if not args.verbose:
         print(response)

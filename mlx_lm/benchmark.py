@@ -68,6 +68,30 @@ def setup_arg_parser():
         help="Step size for prefill processing (default: 2048)",
     )
     parser.add_argument(
+        "--specprefill-model",
+        type=str,
+        default=None,
+        help="Small model for SpecPrefill TTFT reduction.",
+    )
+    parser.add_argument(
+        "--specprefill-keep-pct",
+        type=float,
+        default=0.3,
+        help="Fraction of tokens to keep during SpecPrefill.",
+    )
+    parser.add_argument(
+        "--specprefill-threshold",
+        type=int,
+        default=8192,
+        help="Minimum prompt length to trigger SpecPrefill.",
+    )
+    parser.add_argument(
+        "--specprefill-lookahead",
+        type=int,
+        default=8,
+        help="Lookahead decode steps for SpecPrefill.",
+    )
+    parser.add_argument(
         "--delay",
         type=int,
         default=0,
@@ -104,6 +128,11 @@ def main():
             model_config={"quantize_activations": args.quantize_activations},
         )
 
+    # Load specprefill model if specified
+    specprefill_model = None
+    if args.specprefill_model:
+        specprefill_model, _ = load(args.specprefill_model)
+
     # Empty to avoid early stopping
     tokenizer._eos_token_ids = {}
 
@@ -115,23 +144,39 @@ def main():
     prompt = prompts[0]
 
     def single_bench():
+        kwargs = {"prefill_step_size": args.prefill_step_size}
+        if specprefill_model is not None:
+            kwargs.update({
+                "specprefill_model": specprefill_model,
+                "specprefill_keep_pct": args.specprefill_keep_pct,
+                "specprefill_threshold": args.specprefill_threshold,
+                "specprefill_lookahead": args.specprefill_lookahead,
+            })
         for response in stream_generate(
             model,
             tokenizer,
             prompt,
             max_tokens=generation_tokens,
-            prefill_step_size=args.prefill_step_size,
+            **kwargs,
         ):
             pass
         return response
 
     def batch_bench():
+        kwargs = {"prefill_step_size": args.prefill_step_size}
+        if specprefill_model is not None:
+            kwargs.update({
+                "specprefill_model": specprefill_model,
+                "specprefill_keep_pct": args.specprefill_keep_pct,
+                "specprefill_threshold": args.specprefill_threshold,
+                "specprefill_lookahead": args.specprefill_lookahead,
+            })
         return batch_generate(
             model,
             tokenizer,
             prompts,
             max_tokens=generation_tokens,
-            prefill_step_size=args.prefill_step_size,
+            **kwargs,
         ).stats
 
     if batch_size == 1:
