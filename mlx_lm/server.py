@@ -939,7 +939,7 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt and state machine
-            prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+            prompt, segments, segment_types, initial_state = self._tokenize(tokenizer, request, args)
             sm, sequences = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
