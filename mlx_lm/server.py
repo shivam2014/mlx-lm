@@ -960,6 +960,11 @@ class ResponseGenerator:
                 kv_kwargs["kv_bits"] = self.cli_args.kv_bits
                 kv_kwargs["kv_group_size"] = self.cli_args.kv_group_size
                 kv_kwargs["quantized_kv_start"] = self.cli_args.quantized_kv_start
+
+            # Ensure MLX has a default Metal stream for this thread
+            # (required before any MLX operation; avoids "no Stream in current thread" errors)
+            mx.default_stream(mx.default_device())
+
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -1454,7 +1459,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         try:
             for gen in response:
-                logging.debug(gen.text)
+                # logging.debug(gen.text)  # muted: per-token debug spam
 
                 # Collect the text according to our current state and state
                 # transitions. Reasoning or tool or normal text.
@@ -1871,15 +1876,15 @@ def main():
     )
     parser.add_argument(
         "--kv-bits",
-        type=int,
+        type=lambda s: eval(s) if s.startswith("(") else int(s),
         default=None,
-        help="Number of bits for KV cache quantization. None means no quantization.",
+        help="Number of bits for KV cache quantization (int or tuple '(k,v)' for KVSplit). None means no quantization.",
     )
     parser.add_argument(
         "--kv-group-size",
-        type=int,
+        type=lambda s: eval(s) if s.startswith("(") else int(s),
         default=64,
-        help="Group size for KV cache quantization (default: 64)",
+        help="Group size for KV cache quantization (int or tuple '(k,v)' for KVSplit, default: 64)",
     )
     parser.add_argument(
         "--quantized-kv-start",
