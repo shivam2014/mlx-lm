@@ -42,7 +42,6 @@ from .generate import (
 from .models.cache import (
     LRUPromptCache,
     make_prompt_cache,
-    trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
@@ -1050,10 +1049,11 @@ class ResponseGenerator:
                     # For intermediate chunks (like the 28k "system" prompt), we duplicate
                     # the cache and trim off the tokens that came after this boundary.
                     try:
-                        intermediate_cache = copy.deepcopy(cache)
+                        intermediate_cache = [copy.copy(c) for c in cache]
                         tokens_to_trim = len(cache_key) - current_idx
                         if tokens_to_trim > 0:
-                            trim_prompt_cache(intermediate_cache, tokens_to_trim)
+                            for c in intermediate_cache:
+                                c.trim(tokens_to_trim)
 
                         self.prompt_cache.insert_cache(
                             self.model_provider.model_key,
