@@ -598,6 +598,9 @@ class ResponseGenerator:
                 if a != b:
                     sys_end = i
                     break
+            else:
+                if len(sys_tokens) <= len(prompt):
+                    sys_end = len(sys_tokens)
             if sys_end > 0 and sys_end < len(prompt):
                 segments.append(prompt[:sys_end])
                 segment_types.append("system")
