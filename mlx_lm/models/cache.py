@@ -2099,6 +2099,10 @@ class LRUPromptCache:
                     self._n_bytes += entry.nbytes
                     self._n_bytes_by_type[entry.cache_type] += entry.nbytes
                     self._lru.push(model, prefix, entry.cache_type)
+                    logger.debug(
+                        f"SsdCache HIT: restored {len(prefix)} tokens "
+                        f"({entry.nbytes / 1e6:.1f} MB) from disk to RAM trie"
+                    )
                     return copy.deepcopy(cache), tokens[i:]
 
         return None, tokens
@@ -2332,6 +2336,10 @@ class SsdCache:
                 self._index[key] = entry
                 self._save_index()
             self._enforce_size_limit()
+            logger.debug(
+                f"SsdCache saved entry '{key[:12]}' "
+                f"({stat.st_size / 1e6:.1f} MB, {len(tokens)} tokens)"
+            )
             return key
         except Exception as e:
             logger.warning(f"SsdCache save failed for key {key}: {e}")
@@ -2370,6 +2378,11 @@ class SsdCache:
             with self._lock:
                 if key in self._index:
                     self._index[key].mtime = path.stat().st_mtime
+            logger.debug(
+                f"SsdCache loaded entry '{key[:12]}' "
+                f"({metadata.get('token_count', '?')} tokens, "
+                f"{path.stat().st_size / 1e6:.1f} MB)"
+            )
             return cache_layers
         except Exception as e:
             logger.warning(f"SsdCache load failed for key {key}: {e}")
