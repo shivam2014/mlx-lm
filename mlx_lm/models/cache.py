@@ -2250,15 +2250,23 @@ class SsdCache:
         return self.cache_dir / key[:2] / f"{key}.safetensors"
 
     def _load_index(self) -> None:
-        """Read _index.json if it exists."""
+        """Read _index.json if it exists. Falls back to directory scan on error."""
         if self._index_path.exists():
-            with open(self._index_path, "r") as f:
-                data = json.load(f)
-            for entry_dict in data:
-                entry = SsdCacheEntry(**entry_dict)
-                self._index[entry.key] = entry
-        else:
-            self._scan_directory()
+            try:
+                with open(self._index_path, "r") as f:
+                    data = json.load(f)
+                for entry_dict in data:
+                    entry = SsdCacheEntry(**entry_dict)
+                    self._index[entry.key] = entry
+                return
+            except (json.JSONDecodeError, OSError, TypeError) as e:
+                logger.warning(
+                    f"SsdCache index corrupted at {self._index_path}, "
+                    f"rebuilding from directory scan: {e}"
+                )
+                # Remove corrupted index so the scan can regenerate it
+                self._index_path.unlink(missing_ok=True)
+        self._scan_directory()
 
     def _scan_directory(self) -> None:
         """Rebuild index by walking cache_dir for .safetensors files."""
