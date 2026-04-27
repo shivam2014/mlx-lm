@@ -1464,11 +1464,14 @@ class APIHandler(BaseHTTPRequestHandler):
         # Keep connection alive during long prompt processing and show
         # a tqdm progress bar for prompt processing in the server terminal.
         pbar = None
+        _prefill_started = 0.0
+        _prefill_time = 0.0
         def keepalive_callback(processed, total):
-            nonlocal pbar
+            nonlocal pbar, _prefill_started, _prefill_time
             if total > 0 and processed < total:
                 if pbar is None:
                     pbar = tqdm(total=total, desc="Prefill", unit="tok")
+                    _prefill_started = time.perf_counter()
                 n_new = processed - pbar.n
                 if n_new > 0:
                     pbar.update(n_new)
@@ -1476,6 +1479,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 pbar.update(total - pbar.n)
                 pbar.close()
                 pbar = None
+                if _prefill_started > 0:
+                    _prefill_time = time.perf_counter() - _prefill_started
+                    _prefill_started = 0.0
             if self.stream:
                 msg = f": keepalive {processed}/{total}\n\n".encode()
                 self.wfile.write(msg)
@@ -1483,13 +1489,11 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Create the token generator
         try:
-            _t0 = time.perf_counter()
             ctx, response = self.response_generator.generate(
                 request,
                 args,
                 progress_callback=keepalive_callback,
             )
-            _prefill_time = time.perf_counter() - _t0
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
@@ -1621,10 +1625,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         finally:
             _gen_time = time.perf_counter() - _gen_start
-            _prompt_tps = len(ctx.prompt) / _prefill_time
+            _prompt_tps = len(ctx.prompt) / _prefill_time if _prefill_time > 0 else 0.0
             _gen_tps = len(tokens) / _gen_time if _gen_time > 0 else 0.0
             _peak_mem = mx.get_peak_memory() / 1e9
-            logging.debug(
+            logging.info(
                 "PERF: prompt_tps=%.1f gen_tps=%.1f prompt_tok=%d gen_tok=%d "
                 "prefill=%.2fs gen=%.2fs peak_mem=%.2fGB",
                 _prompt_tps, _gen_tps, len(ctx.prompt), len(tokens),
