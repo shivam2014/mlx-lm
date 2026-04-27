@@ -39,11 +39,13 @@ from .generate import (
     SequenceStateMachine,
     stream_generate,
 )
+from .hermes_prefix_cache import HermesPrefixOptimizer
 from .models.cache import (
     LRUPromptCache,
     SsdCache,
     make_prompt_cache,
 )
+from .models.block_ssd_cache import BlockSSDCache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -475,6 +477,12 @@ class ResponseGenerator:
             logging.info(
                 f"SSD Cache: {ssd.entry_count} entries, {ssd.total_bytes / 1e9:.2f} GB"
             )
+        block_ssd = getattr(self.prompt_cache, "_block_ssd_cache", None)
+        if block_ssd is not None:
+            logging.info(
+                f"Block SSD Cache: {block_ssd.block_count} blocks, "
+                f"{block_ssd.total_bytes / 1e9:.2f} GB"
+            )
 
     def _next_request(self, timeout=None):
         request = None
@@ -705,6 +713,16 @@ class ResponseGenerator:
 
         # Load the default model if it is given
         self.model_provider.load_default()
+
+        # Set up Hermes prefix optimizer for block SSD cache
+        if self.model_provider.tokenizer is not None:
+            hermes_opt = HermesPrefixOptimizer(
+                tokenizer=self.model_provider.tokenizer
+            )
+            self.prompt_cache.set_hermes_optimizer(hermes_opt)
+            logging.info(
+                "Hermes prefix optimizer initialized for block SSD cache"
+            )
 
         current_model = None
         current_sampling = None
@@ -1839,6 +1857,9 @@ def run(
     ssd_cache_dir = getattr(cli_args, "ssd_cache_dir", None)
     ssd_cache_max_size = getattr(cli_args, "ssd_cache_max_size", 0)
     if ssd_cache_dir is not None:
+        logging.warning(
+            "--ssd-cache-dir is deprecated, use --block-ssd-cache-dir instead"
+        )
         ssd_cache = SsdCache(
             cache_dir=Path(ssd_cache_dir).expanduser(),
             max_size_gb=ssd_cache_max_size,
@@ -1846,11 +1867,14 @@ def run(
         n_entries = ssd_cache.entry_count
         total_gb = ssd_cache.total_bytes / 1e9
         logging.info(
-            f"SSD Cache: {n_entries} entries, {total_gb:.2f} GB "
+            f"SSD Cache (legacy): {n_entries} entries, {total_gb:.2f} GB "
             f"(max: {ssd_cache_max_size:.0f} GB) at {ssd_cache_dir}"
         )
     elif ssd_cache_max_size > 0:
         # Default directory
+        logging.warning(
+            "--ssd-cache-max-size is deprecated, use --block-ssd-cache-dir instead"
+        )
         default_dir = Path("~/.cache/mlx-lm/ssd_cache/").expanduser()
         ssd_cache = SsdCache(
             cache_dir=default_dir,
@@ -1859,13 +1883,30 @@ def run(
         n_entries = ssd_cache.entry_count
         total_gb = ssd_cache.total_bytes / 1e9
         logging.info(
-            f"SSD Cache: {n_entries} entries, {total_gb:.2f} GB "
+            f"SSD Cache (legacy): {n_entries} entries, {total_gb:.2f} GB "
             f"(max: {ssd_cache_max_size:.0f} GB) at {default_dir}"
+        )
+
+    # Set up SSD caches
+    block_ssd_cache = None
+    block_ssd_cache_dir = getattr(cli_args, "block_ssd_cache_dir", None)
+    block_ssd_cache_max_size = getattr(cli_args, "block_ssd_cache_max_size", 0)
+    if block_ssd_cache_dir is not None:
+        block_ssd_cache = BlockSSDCache(
+            cache_dir=Path(block_ssd_cache_dir).expanduser(),
+            max_size_gb=block_ssd_cache_max_size,
+        )
+        n_blocks = block_ssd_cache.block_count
+        total_gb = block_ssd_cache.total_bytes / 1e9
+        logging.info(
+            f"Block SSD Cache: {n_blocks} blocks, {total_gb:.2f} GB "
+            f"(max: {block_ssd_cache_max_size:.0f} GB) at {block_ssd_cache_dir}"
         )
 
     prompt_cache = LRUPromptCache(
         cli_args.prompt_cache_size,
         ssd_cache=ssd_cache,
+        block_ssd_cache=block_ssd_cache,
     )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
@@ -2045,8 +2086,21 @@ def main():
     parser.add_argument(
         "--ssd-cache-max-size",
         type=float,
-        default=50.0,
-        help="Maximum SSD cache size in GB (default: 50). Use 0 for unlimited.",
+        default=0,
+        help="Maximum SSD cache size in GB (default: 0 = disabled). Use 0 for unlimited.",
+    )
+    parser.add_argument(
+        "--block-ssd-cache-dir",
+        type=str,
+        default=None,
+        help="Directory for block-level SSD prompt cache. "
+             "Enables block-level prefix reuse across restarts.",
+    )
+    parser.add_argument(
+        "--block-ssd-cache-max-size",
+        type=float,
+        default=0,
+        help="Max size in GB for block SSD cache (0 = unlimited).",
     )
     parser.add_argument(
         "--pipeline",

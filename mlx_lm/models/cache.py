@@ -19,6 +19,13 @@ import pickle
 import threading
 from pathlib import Path
 
+from mlx_lm.models.block_ssd_cache import (
+    BLOCK_SIZE,
+    BlockSSDCache,
+    compute_block_hash,
+    DEFAULT_ROOT_HASH,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -2046,10 +2053,14 @@ class LRUPromptCache:
         max_size: int = 10,
         max_bytes: int = 1 << 63,
         ssd_cache: Optional["SsdCache"] = None,
+        block_ssd_cache: Optional["BlockSSDCache"] = None,
+        hermes_optimizer: Optional = None,
     ):
         self.max_size = max_size
         self.max_bytes = max_bytes
         self._ssd_cache = ssd_cache
+        self._block_ssd_cache = block_ssd_cache
+        self._hermes_optimizer = hermes_optimizer
         self._trie = PromptTrie()
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
@@ -2061,6 +2072,15 @@ class LRUPromptCache:
     @property
     def nbytes(self):
         return self._n_bytes
+
+    def set_hermes_optimizer(self, optimizer=None):
+        """Set or update the Hermes optimizer after construction.
+        
+        The optimizer cannot be created at construction time because
+        the tokenizer isn't available yet. Call this after model loading
+        with a properly initialized optimizer.
+        """
+        self._hermes_optimizer = optimizer
 
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
         result = self._trie.search(model, tokens)
@@ -2081,6 +2101,65 @@ class LRUPromptCache:
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
             return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+
+        # ── Block SSD cache lookup ─────────────────────────────────────
+        if self._block_ssd_cache is not None:
+            model_str = str(model)
+            try:
+                # Use Hermes optimizer to skip blocks we know will miss
+                check_tokens = tokens
+                if self._hermes_optimizer is not None:
+                    cacheable_count = self._hermes_optimizer.get_cacheable_token_count(
+                        tokens
+                    )
+                    if cacheable_count > 0:
+                        check_tokens = tokens[:cacheable_count]
+
+                matched_hashes, div_idx = self._block_ssd_cache.find_longest_block_chain(
+                    check_tokens, model_str
+                )
+
+                if matched_hashes:
+                    # Load blocks from SSD and reconstruct KV cache
+                    all_blocks_cache = []
+                    for block_hash in matched_hashes:
+                        block_cache = self._block_ssd_cache.load_block(block_hash)
+                        if block_cache is None:
+                            # Block file missing or corrupted — abort chain
+                            logger.warning(
+                                f"Block {block_hash.hex()[:12]} in chain "
+                                f"missing, falling back to progressive scan"
+                            )
+                            break
+                        all_blocks_cache.append(block_cache)
+
+                    if all_blocks_cache and len(all_blocks_cache) == len(matched_hashes):
+                        # Merge blocks into a single cache list
+                        merged_cache = self._merge_block_caches(all_blocks_cache)
+                        if merged_cache is not None:
+                            # Cache the merged result in RAM trie for future hits
+                            cached_tokens = tokens[:div_idx]
+                            entry = LRUPromptCache.CacheEntry(
+                                merged_cache,
+                                sum(c.nbytes for c in merged_cache),
+                                "system",  # System prompt blocks
+                            )
+                            self._trie.add(model, cached_tokens, entry)
+                            self._n_bytes += entry.nbytes
+                            self._n_bytes_by_type[entry.cache_type] += entry.nbytes
+                            self._lru.push(model, cached_tokens, entry.cache_type)
+
+                            logger.debug(
+                                f"BlockSSDCache HIT: {len(matched_hashes)} blocks, "
+                                f"{div_idx} tokens from SSD"
+                            )
+                            return copy.deepcopy(merged_cache), tokens[div_idx:]
+
+            except Exception as e:
+                logger.warning(
+                    f"BlockSSDCache lookup failed: {e}, "
+                    f"falling back to progressive scan"
+                )
 
         # SSD fallback: try progressively shorter prefixes on disk
         if self._ssd_cache is not None:
@@ -2148,6 +2227,10 @@ class LRUPromptCache:
                 self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
                 self._lru.remove(model, tokens[:prefix_len])
 
+        # Immediately persist "system" cache blocks to SSD for cross-session reuse.
+        if cache_type == "system" and self._block_ssd_cache is not None:
+            self._save_blocks_to_ssd(str(model), tokens, prompt_cache)
+
         # Ensure we match the constraints
         if len(self._lru) > self.max_size:
             model, tokens = self._lru.pop()
@@ -2156,6 +2239,15 @@ class LRUPromptCache:
                 self._ssd_cache.save_entry(str(model), tokens, entry.prompt_cache)
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+            # Optionally save to block SSD cache — only system entries
+            # are reusable across sessions. Non-system entries (user/assistant)
+            # pollute the cache with unreusable conversation cruft.
+            if (
+                self._block_ssd_cache is not None
+                and entry.prompt_cache
+                and entry.cache_type == "system"
+            ):
+                self._save_blocks_to_ssd(str(model), tokens, entry.prompt_cache)
         while self._n_bytes > self.max_bytes:
             model, tokens = self._lru.pop()
             entry = self._trie.pop(model, tokens)
@@ -2163,6 +2255,13 @@ class LRUPromptCache:
                 self._ssd_cache.save_entry(str(model), tokens, entry.prompt_cache)
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+            # Optionally save to block SSD cache
+            if (
+                self._block_ssd_cache is not None
+                and entry.prompt_cache
+                and entry.cache_type == "system"
+            ):
+                self._save_blocks_to_ssd(str(model), tokens, entry.prompt_cache)
 
     def trim_to(
         self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
@@ -2177,6 +2276,13 @@ class LRUPromptCache:
                 self._ssd_cache.save_entry(str(model), tokens, entry.prompt_cache)
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+            # Optionally save to block SSD cache
+            if (
+                self._block_ssd_cache is not None
+                and entry.prompt_cache
+                and entry.cache_type == "system"
+            ):
+                self._save_blocks_to_ssd(str(model), tokens, entry.prompt_cache)
         while self._n_bytes > n_bytes:
             model, tokens = self._lru.pop()
             entry = self._trie.pop(model, tokens)
@@ -2184,6 +2290,13 @@ class LRUPromptCache:
                 self._ssd_cache.save_entry(str(model), tokens, entry.prompt_cache)
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+            # Optionally save to block SSD cache
+            if (
+                self._block_ssd_cache is not None
+                and entry.prompt_cache
+                and entry.cache_type == "system"
+            ):
+                self._save_blocks_to_ssd(str(model), tokens, entry.prompt_cache)
 
     def stats_by_type(self):
         result = {}
@@ -2206,6 +2319,133 @@ class LRUPromptCache:
             n: Number of entries to load. 0 = all that fit within max_bytes.
         """
         pass
+
+    # ── Block-level SSD cache methods ─────────────────────────────────
+
+    def _merge_block_caches(
+        self, block_caches: List[List[Any]]
+    ) -> Optional[List[Any]]:
+        """
+        Merge consecutive block caches into a single contiguous KV cache.
+
+        For sliceable layers (KVCache): concatenates keys/values along seq dimension.
+        For boundary_only layers: takes the state from the LAST block only.
+
+        Args:
+            block_caches: List of per-layer cache lists, one per block.
+
+        Returns:
+            Merged per-layer cache list, or None if merge fails.
+        """
+        import mlx.core as mx
+        from mlx_lm.models.block_cache_utils import classify_cache_layer
+
+        if not block_caches or len(block_caches) == 0:
+            return None
+
+        num_layers = len(block_caches[0])
+        merged = []
+
+        for layer_idx in range(num_layers):
+            # Get this layer's cache from the first block to determine type
+            first_cache = block_caches[0][layer_idx]
+            layer_type = classify_cache_layer(first_cache)
+
+            if layer_type == "sliceable":
+                # Concatenate along seq dim (axis=2)
+                all_keys = []
+                all_values = []
+                total_tokens = 0
+
+                for block in block_caches:
+                    layer = block[layer_idx]
+                    state = layer.state  # (keys, values), [B, n_kv_heads, seq, dim]
+                    all_keys.append(state[0])
+                    all_values.append(state[1])
+                    total_tokens += state[0].shape[2]
+
+                merged_keys = mx.concatenate(all_keys, axis=2)
+                merged_values = mx.concatenate(all_values, axis=2)
+
+                import copy
+                merged_layer = copy.deepcopy(first_cache)
+                merged_layer.state = (merged_keys, merged_values)
+                merged_layer.offset = total_tokens
+                merged.append(merged_layer)
+
+            elif layer_type in ("boundary_only", "unknown"):
+                # Only the LAST block's state is valid for non-sliceable layers
+                last_block = block_caches[-1][layer_idx]
+                import copy
+                merged.append(copy.deepcopy(last_block))
+
+        return merged
+
+    def _save_blocks_to_ssd(
+        self, model_str: str, tokens: List[int], prompt_cache: List[Any]
+    ) -> None:
+        """
+        Save blocks from a full prompt_cache to the BlockSSDCache.
+
+        Only saves FULL blocks (trailing partial block is NOT saved —
+        consistent with omlx behavior). This is called during insert_cache
+        when RAM entries are evicted or when we want to persist blocks
+        for cross-session reuse.
+        """
+        if self._block_ssd_cache is None:
+            return
+
+        from mlx_lm.models.block_cache_utils import (
+            slice_cache_for_block,
+            get_cache_layer_info,
+        )
+        from mlx_lm.models.block_ssd_cache import compute_block_hash
+
+        info = get_cache_layer_info(prompt_cache)
+
+        num_full_blocks = len(tokens) // BLOCK_SIZE
+        if num_full_blocks == 0:
+            return
+
+        parent_hash: Optional[bytes] = None
+
+        for block_idx in range(num_full_blocks):
+            start_tok = block_idx * BLOCK_SIZE
+            block_tokens = tokens[start_tok : start_tok + BLOCK_SIZE]
+
+            block_hash = compute_block_hash(parent_hash, block_tokens, model_str)
+
+            # Check if already cached (deduplication)
+            if self._block_ssd_cache.contains(block_hash):
+                parent_hash = block_hash
+                continue
+
+            # Slice the KV cache for this block
+            block_cache = slice_cache_for_block(
+                prompt_cache, start_tok, BLOCK_SIZE
+            )
+
+            # Save to SSD
+            metadata = {
+                "model_name": model_str,
+                "num_layers": info["num_layers"],
+                "token_count": BLOCK_SIZE,
+                "layer_cache_types": info["layer_cache_types"],
+            }
+            self._block_ssd_cache.save_block(block_hash, block_cache, metadata)
+            parent_hash = block_hash
+
+            logger.debug(
+                f"Saved block {block_hash.hex()[:12]} "
+                f"(tokens {start_tok}-{start_tok + BLOCK_SIZE})"
+            )
+
+        # Flush pending async writes then evict once.
+        # Deferred eviction prevents the thrashing bug where eager
+        # _maybe_evict() inside _write_block_sync removes blocks that
+        # were verified by contains() earlier in this loop.
+        self._block_ssd_cache.flush()
+        self._block_ssd_cache.shrink()
 
 
 @dataclass
