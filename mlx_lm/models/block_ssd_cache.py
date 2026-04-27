@@ -8,6 +8,7 @@ Design reference: omlx/cache/paged_ssd_cache.py
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -267,6 +268,20 @@ class BlockSSDCache:
         self._load_index()
         self._start_async_writer()
 
+        # Hot/in-memory LRU block cache for recently loaded blocks
+        self._hot_cache: Dict[bytes, List[Any]] = {}
+        self._hot_cache_order: OrderedDict[bytes, None] = OrderedDict()
+        self._hot_cache_max_items = 128
+
+        # Stats tracking
+        self._stats: Dict[str, int] = {
+            "hot_cache_hits": 0,
+            "hot_cache_misses": 0,
+            "disk_loads": 0,
+            "disk_saves": 0,
+            "batch_loads": 0,
+        }
+
     # ── Public API ──────────────────────────────────────────────────
 
     def contains(self, block_hash: bytes) -> bool:
@@ -286,11 +301,24 @@ class BlockSSDCache:
 
     def load_block(self, block_hash: bytes) -> Optional[List[Any]]:
         """
-        Load KV cache tensors for a block from SSD.
+        Load KV cache tensors for a block from SSD or in-memory hot cache.
+
+        Checks the LRU hot cache first (O(1) lookup). On cache hit, returns
+        a deep copy of the cached layers. On miss, loads from disk via
+        mx.load(), promotes to hot cache, and returns.
 
         Returns:
             List of per-layer cache objects, or None if not found/corrupted.
         """
+        # Check hot cache first (fast path)
+        with self._lock:
+            if block_hash in self._hot_cache:
+                self._hot_cache_order.move_to_end(block_hash)
+                self._stats["hot_cache_hits"] += 1
+                return copy.deepcopy(self._hot_cache[block_hash])
+
+            self._stats["hot_cache_misses"] += 1
+
         meta = self.get_meta(block_hash)
         if meta is None:
             logger.debug(f"Block {block_hash.hex()[:12]} not in index")
@@ -302,26 +330,203 @@ class BlockSSDCache:
             return None
 
         try:
-            # Reuse existing load_prompt_cache — it reads safetensors format
-            from mlx_lm.models.cache import load_prompt_cache
-            cache_layers, metadata = load_prompt_cache(
+            # Direct mx.load() — avoids load_prompt_cache overhead
+            import mlx.core as mx
+
+            arrays, cache_metadata = mx.load(
                 str(meta.file_path), return_metadata=True
             )
-            # Validate layer count
-            stored_layers = metadata.get("num_layers")
-            if stored_layers and int(stored_layers) != meta.num_layers:
-                logger.warning(
-                    f"Layer count mismatch for block {block_hash.hex()[:12]}: "
-                    f"expected {meta.num_layers}, got {stored_layers}"
-                )
+            cache_layers = self._reconstruct_cache_data(
+                arrays, cache_metadata,
+                meta.num_layers, meta.layer_cache_types,
+            )
+            if cache_layers is None:
                 return None
-            return cache_layers
+
+            # Promote to hot cache (with eviction if at capacity)
+            self._promote_to_hot_cache(block_hash, cache_layers)
+
+            # Track stats
+            with self._lock:
+                self._stats["disk_loads"] += 1
+
+            return copy.deepcopy(cache_layers)
         except Exception as e:
             logger.warning(f"Failed to load block {block_hash.hex()[:12]}: {e}")
             # Corrupt file — remove it
             meta.file_path.unlink(missing_ok=True)
             self._remove_from_index(block_hash)
             return None
+
+    def _reconstruct_cache_data(
+        self,
+        arrays: Dict[str, Any],
+        cache_metadata: Dict[str, str],
+        expected_num_layers: int,
+        layer_cache_types: List[str],
+    ) -> Optional[List[Any]]:
+        """Reconstruct cache layers from raw mx.load() output.
+
+        This mirrors the logic of load_prompt_cache() without importing it:
+          arrays, cache_metadata = mx.load(path, return_metadata=True)
+          arrays = tree_unflatten(list(arrays.items()))
+          cache_metadata = tree_unflatten(list(cache_metadata.items()))
+          info, metadata, classes = cache_metadata
+          cache = [
+              globals()[c].from_state(state, meta_state)
+              for c, state, meta_state in zip(classes, arrays, info)
+          ]
+
+        Args:
+            arrays: Flat dict of tensor name -> array from mx.load().
+            cache_metadata: Flat dict of metadata keys from mx.load().
+            expected_num_layers: Expected number of cache layers (for validation).
+            layer_cache_types: List of class names (e.g. ["KVCache", "KVCache", "ArraysCache"]).
+
+        Returns:
+            List of reconstructed cache objects, or None on mismatch/error.
+        """
+        from mlx.utils import tree_unflatten
+        from mlx_lm.models import cache as cache_module
+
+        try:
+            # Restore nested structure from flat dicts
+            arrays_nested = tree_unflatten(list(arrays.items()))
+            meta_nested = tree_unflatten(list(cache_metadata.items()))
+
+            # meta_nested = (info, metadata_dict, classes)
+            if not isinstance(meta_nested, (list, tuple)) or len(meta_nested) < 3:
+                logger.warning(
+                    f"Unexpected metadata structure: {type(meta_nested).__name__}"
+                )
+                return None
+            info, metadata_dict, classes = meta_nested[:3]
+
+            # Validate metadata
+            if not isinstance(metadata_dict, dict):
+                metadata_dict = {}
+
+            stored_layers = metadata_dict.get("num_layers")
+            if stored_layers is not None:
+                try:
+                    if int(stored_layers) != expected_num_layers:
+                        logger.warning(
+                            f"Layer count mismatch: expected {expected_num_layers}, "
+                            f"got {stored_layers}"
+                        )
+                        return None
+                except (ValueError, TypeError):
+                    pass
+
+            # Reconstruct each cache layer
+            cache: List[Any] = []
+            for i, (class_name, state, meta_state) in enumerate(
+                zip(classes, arrays_nested, info)
+            ):
+                cls = getattr(cache_module, class_name, None)
+                if cls is None:
+                    logger.warning(
+                        f"Unknown cache class {class_name} at layer {i}"
+                    )
+                    return None
+                cache.append(cls.from_state(state, meta_state))
+
+            return cache
+        except Exception as e:
+            logger.warning(f"Failed to reconstruct cache data: {e}")
+            return None
+
+    def _promote_to_hot_cache(
+        self, block_hash: bytes, cache_layers: List[Any]
+    ) -> None:
+        """Insert or update a block in the in-memory LRU hot cache.
+
+        Evicts the LRU entry if at capacity. Thread-safe under self._lock.
+        """
+        with self._lock:
+            if block_hash in self._hot_cache:
+                # Already present — just update and move to end
+                self._hot_cache[block_hash] = cache_layers
+                self._hot_cache_order.move_to_end(block_hash)
+                return
+
+            # Evict LRU if at capacity
+            if len(self._hot_cache) >= self._hot_cache_max_items:
+                oldest, _ = self._hot_cache_order.popitem(last=False)
+                self._hot_cache.pop(oldest, None)
+
+            # Insert new entry
+            self._hot_cache[block_hash] = cache_layers
+            self._hot_cache_order[block_hash] = None
+
+    def load_blocks_batch(
+        self, block_hashes: List[bytes]
+    ) -> List[Tuple[bytes, Optional[List[Any]]]]:
+        """Load multiple blocks in a single batch, checking hot cache first.
+
+        For each hash in the list:
+          1. Check hot cache — if found, return cached result immediately.
+          2. Otherwise, load safetensors file from disk.
+          3. Promote newly loaded blocks to hot cache.
+
+        Args:
+            block_hashes: List of content hashes to load.
+
+        Returns:
+            List of (block_hash, cache_layers_or_None) tuples in the same
+            order as the input list.
+        """
+        results: List[Tuple[bytes, Optional[List[Any]]]] = []
+        disk_hashes: List[bytes] = []
+
+        # Phase 1: Check hot cache for all hashes
+        with self._lock:
+            for h in block_hashes:
+                if h in self._hot_cache:
+                    self._hot_cache_order.move_to_end(h)
+                    self._stats["hot_cache_hits"] += 1
+                    results.append((h, copy.deepcopy(self._hot_cache[h])))
+                else:
+                    self._stats["hot_cache_misses"] += 1
+                    results.append((h, None))
+                    disk_hashes.append(h)
+
+        if not disk_hashes:
+            return results
+
+        # Phase 2: Load remaining blocks from disk
+        with self._lock:
+            self._stats["batch_loads"] += 1
+
+        for idx, h in enumerate(disk_hashes):
+            # Find the original index in results
+            orig_idx = next(
+                i for i, (rh, _) in enumerate(results) if rh == h
+            )
+            loaded = self.load_block(h)
+            results[orig_idx] = (h, loaded)
+
+        return results
+
+    def load_blocks_batch(self, block_hashes: List[bytes]) -> List[Optional[List[Any]]]:
+        """
+        Load multiple blocks from SSD in a single batch call.
+
+        Replaces the serial load_block loop in fetch_nearest_cache with
+        a bulk method that can be optimized later (e.g. parallel reads).
+
+        Args:
+            block_hashes: List of block content hashes to load.
+
+        Returns:
+            List of per-layer cache lists, one per hash. Missing/corrupt
+            blocks return None and are reported via logger.
+        """
+        results: List[Optional[List[Any]]] = []
+        for block_hash in block_hashes:
+            block_cache = self.load_block(block_hash)
+            results.append(block_cache)
+        return results
 
     def save_block(
         self,
@@ -369,6 +574,9 @@ class BlockSSDCache:
                 f"writing block {block_hash.hex()[:12]} synchronously"
             )
             self._write_block_sync(block_hash, tensors_raw, safetensors_meta, file_path)
+
+        with self._lock:
+            self._stats["disk_saves"] += 1
 
         return True
 
@@ -670,20 +878,36 @@ class BlockSSDCache:
                 hex_hash = fpath.stem
                 block_hash = bytes.fromhex(hex_hash)
 
-                # Try to read metadata from the file for validation
-                from mlx_lm.models.cache import load_prompt_cache
-                _, metadata = load_prompt_cache(str(fpath), return_metadata=True)
+                # Read metadata using mx.load() directly
+                import mlx.core as mx
+
+                _, cache_metadata = mx.load(str(fpath), return_metadata=True)
+                from mlx.utils import tree_unflatten
+
+                meta_nested = tree_unflatten(list(cache_metadata.items()))
+                if isinstance(meta_nested, (list, tuple)) and len(meta_nested) >= 2:
+                    # (info, metadata_dict, classes) or (info, metadata_dict)
+                    if len(meta_nested) >= 2:
+                        metadata_dict = meta_nested[1]
+                    else:
+                        metadata_dict = {}
+                    if isinstance(metadata_dict, dict):
+                        pass
+                    else:
+                        metadata_dict = {}
+                else:
+                    metadata_dict = {}
 
                 meta = BlockMeta(
                     block_hash=block_hash,
                     file_path=fpath,
                     file_size=stat.st_size,
-                    token_count=int(metadata.get("token_count", "256")),
-                    num_layers=int(metadata.get("num_layers", "0")),
-                    model_name=metadata.get("model_name", ""),
+                    token_count=int(metadata_dict.get("token_count", "256")),
+                    num_layers=int(metadata_dict.get("num_layers", "0")),
+                    model_name=metadata_dict.get("model_name", ""),
                     layer_cache_types=(
-                        json.loads(metadata["layer_cache_types"])
-                        if metadata.get("layer_cache_types")
+                        json.loads(metadata_dict["layer_cache_types"])
+                        if metadata_dict.get("layer_cache_types")
                         else []
                     ),
                     created_at=stat.st_mtime,
@@ -740,6 +964,12 @@ class BlockSSDCache:
         self._save_index()
 
     @property
+    def stats(self) -> Dict[str, int]:
+        """Return a snapshot of current usage statistics."""
+        with self._lock:
+            return dict(self._stats)
+
+    @property
     def total_bytes(self) -> int:
         with self._lock:
             return self._total_bytes
@@ -750,11 +980,13 @@ class BlockSSDCache:
             return len(self._index)
 
     def clear(self) -> None:
-        """Delete all cached blocks."""
+        """Delete all cached blocks and clear in-memory hot cache."""
         with self._lock:
             for meta in self._index.values():
                 meta.file_path.unlink(missing_ok=True)
             self._index.clear()
             self._lru.clear()
             self._total_bytes = 0
+            self._hot_cache.clear()
+            self._hot_cache_order.clear()
             self._save_index()
