@@ -41,6 +41,7 @@ from .generate import (
 )
 from .models.cache import (
     LRUPromptCache,
+    SsdCache,
     make_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
@@ -468,6 +469,11 @@ class ResponseGenerator:
             n_bytes = stats["n_bytes"]
             logging.info(
                 f"- {cache_type}: {n_sequences} sequences, {n_bytes / 1e9:.2f} GB"
+            )
+        ssd = getattr(self.prompt_cache, "_ssd_cache", None)
+        if ssd is not None:
+            logging.info(
+                f"SSD Cache: {ssd.entry_count} entries, {ssd.total_bytes / 1e9:.2f} GB"
             )
 
     def _next_request(self, timeout=None):
@@ -1826,7 +1832,41 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+
+    # Set up SSD cache if enabled
+    cli_args = model_provider.cli_args
+    ssd_cache = None
+    ssd_cache_dir = getattr(cli_args, "ssd_cache_dir", None)
+    ssd_cache_max_size = getattr(cli_args, "ssd_cache_max_size", 0)
+    if ssd_cache_dir is not None:
+        ssd_cache = SsdCache(
+            cache_dir=Path(ssd_cache_dir).expanduser(),
+            max_size_gb=ssd_cache_max_size,
+        )
+        n_entries = ssd_cache.entry_count
+        total_gb = ssd_cache.total_bytes / 1e9
+        logging.info(
+            f"SSD Cache: {n_entries} entries, {total_gb:.2f} GB "
+            f"(max: {ssd_cache_max_size:.0f} GB) at {ssd_cache_dir}"
+        )
+    elif ssd_cache_max_size > 0:
+        # Default directory
+        default_dir = Path("~/.cache/mlx-lm/ssd_cache/").expanduser()
+        ssd_cache = SsdCache(
+            cache_dir=default_dir,
+            max_size_gb=ssd_cache_max_size,
+        )
+        n_entries = ssd_cache.entry_count
+        total_gb = ssd_cache.total_bytes / 1e9
+        logging.info(
+            f"SSD Cache: {n_entries} entries, {total_gb:.2f} GB "
+            f"(max: {ssd_cache_max_size:.0f} GB) at {default_dir}"
+        )
+
+    prompt_cache = LRUPromptCache(
+        cli_args.prompt_cache_size,
+        ssd_cache=ssd_cache,
+    )
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
@@ -1995,6 +2035,18 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--ssd-cache-dir",
+        type=str,
+        default=None,
+        help="Directory for SSD-backed prompt cache (default: ~/.cache/mlx-lm/ssd_cache/)",
+    )
+    parser.add_argument(
+        "--ssd-cache-max-size",
+        type=float,
+        default=50.0,
+        help="Maximum SSD cache size in GB (default: 50). Use 0 for unlimited.",
     )
     parser.add_argument(
         "--pipeline",
