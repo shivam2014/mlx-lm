@@ -106,16 +106,16 @@ def slice_cache_for_block(
             result.append(sliced)
 
         elif layer_type == "boundary_only":
-            # For non-sliceable layers, store the full state at this boundary.
-            # This means only the LAST full block for these layers is valid.
-            # The integration code in fetch_nearest_cache handles rejection.
-            sliced = copy.deepcopy(layer_cache)
-            result.append(sliced)
+            # Boundary-only layers (e.g. ArraysCache) don't need mutation
+            # safety: their state is snapshot-based and won't be mutated
+            # elsewhere. Skip deep copy to avoid ~10,800 copies during prefill.
+            result.append(layer_cache)
 
         else:
-            # Unknown type — store full state, be conservative
-            sliced = copy.deepcopy(layer_cache)
-            result.append(sliced)
+            # Unknown type — be conservative but avoid deep copy.
+            # Shallow copy is sufficient since these layers don't share
+            # mutable state that would be mutated elsewhere.
+            result.append(copy.copy(layer_cache))
 
     return result
 

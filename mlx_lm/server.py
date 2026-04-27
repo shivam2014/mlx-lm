@@ -1099,6 +1099,12 @@ class ResponseGenerator:
                     except Exception as e:
                         logging.warning(f"Failed to extract intermediate {seg_type} cache: {e}")
 
+            # Flush any pending SSD block saves deferred during prefill.
+            # This batch-processes all queued block writes with a single
+            # mx.eval() call, avoiding per-block GPU sync stalls.
+            if hasattr(self.prompt_cache, 'flush_pending_ssd_saves'):
+                self.prompt_cache.flush_pending_ssd_saves()
+
 
         except Exception as e:
             rqueue.put(e)
