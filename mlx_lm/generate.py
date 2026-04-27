@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import logging
 import sys
 import time
 from collections import deque
@@ -322,9 +323,17 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
     if kv_boundary_layers > 0 and kv_boundary_bits is not None and len(kv_indices) > 0:
         kv_boundary_set = set(kv_indices[:kv_boundary_layers])
         kv_boundary_set.update(kv_indices[-kv_boundary_layers:])
+    if len(kv_indices) > 0:
+        logging.debug(
+            "KV cache: %d layers found (indices=%s), boundary_set=%s, "
+            "boundary_bits=%s, middle_bits=%s, group_size=%s",
+            len(kv_indices), kv_indices[:10], kv_boundary_set,
+            kv_boundary_bits, kv_bits, kv_group_size,
+        )
     for e in kv_indices:
         c = prompt_cache[e]
         bits = kv_boundary_bits if e in kv_boundary_set else kv_bits
+        logging.debug("  cache[%d] -> quantize to %s", e, bits)
         prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=bits)
 
 
