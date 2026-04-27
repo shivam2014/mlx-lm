@@ -1053,7 +1053,14 @@ class ResponseGenerator:
                         tokens_to_trim = len(cache_key) - current_idx
                         if tokens_to_trim > 0:
                             for c in intermediate_cache:
-                                if hasattr(c, "trim"):
+                                if not hasattr(c, "trim"):
+                                    logging.error(
+                                        f"Cache element {type(c).__name__} missing trim() "
+                                        "method — intermediate cache will contain excess "
+                                        "tokens beyond segment boundary. Generation quality "
+                                        "may be affected."
+                                    )
+                                else:
                                     c.trim(tokens_to_trim)
 
                         self.prompt_cache.insert_cache(
@@ -1214,9 +1221,9 @@ class APIHandler(BaseHTTPRequestHandler):
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
-            self.max_tokens = self.body.get(
-                "max_tokens", self.response_generator.cli_args.max_tokens
-            )
+            self.max_tokens = self.body.get("max_tokens", None)
+            if self.max_tokens is None:
+                self.max_tokens = -1
         self.temperature = self.body.get(
             "temperature", self.response_generator.cli_args.temp
         )
@@ -1275,7 +1282,7 @@ class APIHandler(BaseHTTPRequestHandler):
     def validate_model_parameters(self):
         """Validate that the passed model parameters have correct types and values."""
         self._validate("stream", bool)
-        self._validate("max_tokens", int, min_val=0)
+        self._validate("max_tokens", int, min_val=0, whitelist=[-1])
         self._validate("temperature", (float, int), min_val=0)
         self._validate("top_p", (float, int), min_val=0, max_val=1)
         self._validate("top_k", int, min_val=0)

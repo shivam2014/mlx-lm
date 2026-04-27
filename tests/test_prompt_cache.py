@@ -18,6 +18,7 @@ from mlx_lm.models.cache import (
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
+    can_trim_prompt_cache,
     load_prompt_cache,
     make_prompt_cache,
     save_prompt_cache,
@@ -216,13 +217,13 @@ class TestPromptCache(unittest.TestCase):
         num_trimmed = trim_prompt_cache(cache, 4)
         self.assertEqual(num_trimmed, 3)
 
-        # Can't trim arrays cache
+        # ArraysCache is trimmable (no-op trim for static features)
         cache = [ArraysCache(size=2) for _ in range(2)]
         for c in cache:
             c[0] = mx.zeros((5, 5))
             c[1] = mx.zeros((5, 5))
         num_trimmed = trim_prompt_cache(cache, 7)
-        self.assertEqual(num_trimmed, 0)
+        self.assertEqual(num_trimmed, 7)
 
         # All cache's have to be trimmable
         cache = [ArraysCache(size=2), KVCache()]
@@ -231,7 +232,7 @@ class TestPromptCache(unittest.TestCase):
         x = mx.random.uniform(shape=(1, 8, 10, 4))
         cache[1].update_and_fetch(x, x)
         num_trimmed = trim_prompt_cache(cache, 1)
-        self.assertEqual(num_trimmed, 0)
+        self.assertEqual(num_trimmed, 1)
 
         cache = [RotatingKVCache(max_size=6) for _ in range(2)]
         for c in cache:
@@ -261,6 +262,60 @@ class TestPromptCache(unittest.TestCase):
         # Trim more tokens than remain
         num_trimmed = trim_prompt_cache(cache, 4)
         self.assertEqual(num_trimmed, 3)
+
+    def test_arrays_cache_trimmable_interface(self):
+        # Direct API: ArraysCache.is_trimmable() should return True
+        ac = ArraysCache(size=2)
+        self.assertTrue(ac.is_trimmable())
+
+        # Direct API: ArraysCache.trim(n) should return n unchanged
+        result = ac.trim(42)
+        self.assertEqual(result, 42)
+
+        # trim(0) edge case — no-op boundary
+        result = ac.trim(0)
+        self.assertEqual(result, 0)
+
+        # Empty ArraysCache (no data set) should still be trimmable
+        ac_empty = ArraysCache(size=4)
+        self.assertTrue(ac_empty.is_trimmable())
+        result = ac_empty.trim(100)
+        self.assertEqual(result, 100)
+
+    def test_can_trim_prompt_cache_with_arrays_cache(self):
+        # Homogeneous ArraysCache: should be trimmable
+        cache_ac = [ArraysCache(size=2) for _ in range(3)]
+        self.assertTrue(can_trim_prompt_cache(cache_ac))
+
+        # Mixed with KVCache: all trimmable
+        cache_mixed = [ArraysCache(size=2), KVCache(), ArraysCache(size=4)]
+        self.assertTrue(can_trim_prompt_cache(cache_mixed))
+
+        # Mixed with QuantizedKVCache: all trimmable
+        cache_mixed_q = [ArraysCache(size=2), QuantizedKVCache()]
+        self.assertTrue(can_trim_prompt_cache(cache_mixed_q))
+
+        # Single ArraysCache (common multimodal case)
+        cache_single = [ArraysCache(size=1)]
+        self.assertTrue(can_trim_prompt_cache(cache_single))
+
+        # Empty list: vacuous truth from all([])
+        self.assertTrue(can_trim_prompt_cache([]))
+
+    def test_cache_list_arrays_cache_only(self):
+        # CacheList with only ArraysCache should be trimmable
+        c = CacheList(ArraysCache(size=2), ArraysCache(size=3))
+        self.assertTrue(c.is_trimmable())
+
+        # Trim on homogeneous ArraysCache CacheList
+        n = c.trim(50)
+        self.assertEqual(n, 50)
+
+        # Single-elem CacheList
+        c_single = CacheList(ArraysCache(size=1))
+        self.assertTrue(c_single.is_trimmable())
+        n = c_single.trim(10)
+        self.assertEqual(n, 10)
 
     def test_trim_cache_with_generate(self):
         model, tokenizer = self.model, self.tokenizer
@@ -375,7 +430,7 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(m, 5)
 
         c = CacheList(ArraysCache(size=2), KVCache())
-        self.assertFalse(c.is_trimmable())
+        self.assertTrue(c.is_trimmable())
 
         c1 = CacheList(ArraysCache(size=1), KVCache())
         c1[0][0] = mx.random.normal(shape=(1, 2, 4, 4))

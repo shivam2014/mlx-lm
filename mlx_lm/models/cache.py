@@ -1087,6 +1087,14 @@ class ArraysCache(_BaseCache):
                 cache[e][i : i + 1] = caches[i][e]
         return cache
 
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        # ArraysCache stores static per-layer image features with no
+        # token-position offset to rewind. Report success without mutation.
+        return n
+
     def empty(self):
         return self.cache[0] is None
 
@@ -2083,10 +2091,20 @@ class LRUPromptCache:
             self._lru.remove(model, tokens)
         self._lru.push(model, tokens, cache_type)
 
-        # If it is a trimmable cache remove all prefixes cause they just take
-        # space
+        # Remove all prefix entries that are taking space for this branch,
+        # but preserve intermediate checkpoints (system/user) created by
+        # segment-aware caching — they are strategic cache boundaries, not
+        # accidental short entries.
         if can_trim_prompt_cache(prompt_cache):
             for prefix_len, entry in self._trie.pop_prefixes(model, tokens):
+                if entry.cache_type in ("system", "user"):
+                    # pop_prefixes destructively removed __value__ from this
+                    # trie node. Since we're preserving this checkpoint,
+                    # re-insert __value__ so the trie stays in sync with
+                    # the LRU — otherwise eviction later will hit a
+                    # KeyError('__value__') in _trie.pop().
+                    self._trie.add(model, tokens[:prefix_len], entry)
+                    continue
                 self._n_bytes -= entry.nbytes
                 self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
                 self._lru.remove(model, tokens[:prefix_len])
