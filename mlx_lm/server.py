@@ -31,6 +31,7 @@ from typing import (
 
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
+from tqdm import tqdm
 
 from ._version import __version__
 from .generate import (
@@ -1460,10 +1461,21 @@ class APIHandler(BaseHTTPRequestHandler):
             chat_template_kwargs=self.chat_template_kwargs,
         )
 
-        # Keep connection allive during long prompt processing (and also log
-        # the progress)
+        # Keep connection alive during long prompt processing and show
+        # a tqdm progress bar for prompt processing in the server terminal.
+        pbar = None
         def keepalive_callback(processed, total):
-            logging.info(f"Prompt processing progress: {processed}/{total}")
+            nonlocal pbar
+            if total > 0 and processed < total:
+                if pbar is None:
+                    pbar = tqdm(total=total, desc="Prefill", unit="tok")
+                n_new = processed - pbar.n
+                if n_new > 0:
+                    pbar.update(n_new)
+            if pbar is not None and processed >= total:
+                pbar.update(total - pbar.n)
+                pbar.close()
+                pbar = None
             if self.stream:
                 msg = f": keepalive {processed}/{total}\n\n".encode()
                 self.wfile.write(msg)
