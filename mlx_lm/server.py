@@ -1224,6 +1224,13 @@ class APIHandler(BaseHTTPRequestHandler):
             self.max_tokens = self.body.get(
                 "max_tokens", self.response_generator.cli_args.max_tokens
             )
+        # The CLI --max-tokens flag (user's hardware-aware setting) sets
+        # the floor. Client-specified limits are honored as an upper bound
+        # but never allowed to dip below the CLI value — otherwise the
+        # Hermes agent's conservative 8192 default would cap long responses.
+        self.max_tokens = max(
+            self.max_tokens, self.response_generator.cli_args.max_tokens
+        )
         self.temperature = self.body.get(
             "temperature", self.response_generator.cli_args.temp
         )
