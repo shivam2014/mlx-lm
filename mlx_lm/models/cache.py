@@ -3,13 +3,23 @@
 import copy
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 from .base import create_causal_mask
+
+import dataclasses
+import hashlib
+import json
+import logging
+import pickle
+import threading
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def make_prompt_cache(
@@ -2146,3 +2156,223 @@ class LRUPromptCache:
                 "n_bytes": self._n_bytes_by_type[cache_type],
             }
         return result
+
+
+@dataclass
+class SsdCacheEntry:
+    """Metadata for a single SSD-cached prompt cache entry."""
+
+    key: str  # sha256 hex digest
+    path: str  # full path to .safetensors file
+    nbytes: int  # file size in bytes
+    mtime: float  # os.path.getmtime
+    model_key: str  # model identifier
+    token_hash: str  # hash of the token list (separate from cache key)
+
+
+class SsdCache:
+    """Disk-backed tier for LRUPromptCache. One safetensors file per entry."""
+
+    def __init__(
+        self,
+        cache_dir: Union[str, Path],
+        max_size_gb: float = 0,
+    ):
+        """
+        Args:
+            cache_dir: Directory for safetensors files. Created if not exist.
+            max_size_gb: Max disk usage in GB. 0 = unlimited.
+        """
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = int(max_size_gb * 1e9) if max_size_gb > 0 else 0
+        self._lock = threading.Lock()
+        self._index: dict[str, SsdCacheEntry] = {}
+        self._index_path = self.cache_dir / "_index.json"
+        self._load_index()
+
+    def _compute_key(self, model_key: str, tokens: list[int]) -> str:
+        """Deterministic hash from model_key + tokens for stable filenames."""
+        h = hashlib.sha256()
+        h.update(model_key.encode("utf-8"))
+        h.update(b"\0")
+        h.update(pickle.dumps(tokens))
+        return h.hexdigest()
+
+    def _entry_path(self, key: str) -> Path:
+        """Two-char prefix subdir to avoid flat dir explosion."""
+        return self.cache_dir / key[:2] / f"{key}.safetensors"
+
+    def _load_index(self) -> None:
+        """Read _index.json if it exists."""
+        if self._index_path.exists():
+            with open(self._index_path, "r") as f:
+                data = json.load(f)
+            for entry_dict in data:
+                entry = SsdCacheEntry(**entry_dict)
+                self._index[entry.key] = entry
+        else:
+            self._scan_directory()
+
+    def _scan_directory(self) -> None:
+        """Rebuild index by walking cache_dir for .safetensors files."""
+        for fpath in self.cache_dir.rglob("*.safetensors"):
+            key = fpath.stem
+            stat = fpath.stat()
+            self._index[key] = SsdCacheEntry(
+                key=key,
+                path=str(fpath),
+                nbytes=stat.st_size,
+                mtime=stat.st_mtime,
+                model_key="",
+                token_hash="",
+            )
+
+    def _save_index(self) -> None:
+        """Persist index to _index.json atomically."""
+        data = [dataclasses.asdict(e) for e in self._index.values()]
+        tmp = self._index_path.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        tmp.rename(self._index_path)
+
+    def save_entry(
+        self,
+        model_key: str,
+        tokens: list[int],
+        prompt_cache: list[Any],
+    ) -> Optional[str]:
+        """Serialize a cache entry to SSD.
+
+        Args:
+            model_key: Model identifier (used in hash).
+            tokens: Token list that keys this entry.
+            prompt_cache: Per-layer KV cache list (List[Any] with .state,
+                .meta_state, .offset).
+
+        Returns:
+            The cache key string, or None on failure.
+        """
+        key = self._compute_key(model_key, tokens)
+        path = self._entry_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        metadata = {
+            "model_key": model_key,
+            "token_count": str(len(tokens)),
+            "key": key,
+        }
+
+        try:
+            save_prompt_cache(str(path), prompt_cache, metadata)
+            stat = path.stat()
+            entry = SsdCacheEntry(
+                key=key,
+                path=str(path),
+                nbytes=stat.st_size,
+                mtime=stat.st_mtime,
+                model_key=model_key,
+                token_hash=str(hash(tuple(tokens))),
+            )
+            with self._lock:
+                self._index[key] = entry
+                self._save_index()
+            self._enforce_size_limit()
+            return key
+        except Exception as e:
+            logger.warning(f"SsdCache save failed for key {key}: {e}")
+            if path.exists():
+                path.unlink(missing_ok=True)
+            return None
+
+    def load_entry(
+        self,
+        model_key: str,
+        tokens: list[int],
+    ) -> Optional[list[Any]]:
+        """Deserialize a cache entry from SSD.
+
+        Args:
+            model_key: Model identifier.
+            tokens: Token list to compute lookup key.
+
+        Returns:
+            The per-layer KV cache list, or None if not found/error.
+        """
+        key = self._compute_key(model_key, tokens)
+        path = self._entry_path(key)
+
+        if not path.exists():
+            return None
+
+        try:
+            cache_layers, metadata = load_prompt_cache(str(path), return_metadata=True)
+            stored_model = metadata.get("model_key", "")
+            if stored_model and stored_model != model_key:
+                logger.warning(
+                    f"SsdCache model_key mismatch: {stored_model} != {model_key}"
+                )
+                return None
+            with self._lock:
+                if key in self._index:
+                    self._index[key].mtime = path.stat().st_mtime
+            return cache_layers
+        except Exception as e:
+            logger.warning(f"SsdCache load failed for key {key}: {e}")
+            path.unlink(missing_ok=True)
+            with self._lock:
+                self._index.pop(key, None)
+                self._save_index()
+            return None
+
+    def delete_entry(self, key: str) -> bool:
+        """Remove an entry from disk and index."""
+        path = self._entry_path(key)
+        try:
+            path.unlink(missing_ok=True)
+            with self._lock:
+                self._index.pop(key, None)
+                self._save_index()
+            return True
+        except Exception as e:
+            logger.warning(f"SsdCache delete failed for key {key}: {e}")
+            return False
+
+    def _enforce_size_limit(self) -> None:
+        """Delete oldest entries until under max_bytes.
+
+        Called after each save_entry. Evicts oldest by mtime.
+        """
+        if self.max_bytes <= 0:
+            return
+        with self._lock:
+            total = sum(e.nbytes for e in self._index.values())
+            if total <= self.max_bytes:
+                return
+            sorted_entries = sorted(self._index.values(), key=lambda e: e.mtime)
+            for entry in sorted_entries:
+                if total <= self.max_bytes:
+                    break
+                fpath = Path(entry.path)
+                fpath.unlink(missing_ok=True)
+                self._index.pop(entry.key, None)
+                total -= entry.nbytes
+            self._save_index()
+
+    @property
+    def total_bytes(self) -> int:
+        with self._lock:
+            return sum(e.nbytes for e in self._index.values())
+
+    @property
+    def entry_count(self) -> int:
+        with self._lock:
+            return len(self._index)
+
+    def clear(self) -> None:
+        """Delete all cached entries."""
+        with self._lock:
+            for entry in self._index.values():
+                Path(entry.path).unlink(missing_ok=True)
+            self._index.clear()
+            self._save_index()
