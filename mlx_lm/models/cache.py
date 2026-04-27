@@ -2065,6 +2065,7 @@ class LRUPromptCache:
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
         self._n_bytes_by_type = {k: 0 for k in self._lru._ordering}
+        self._pending_ssd_saves: List[Tuple[str, List[int], List[Any]]] = []
 
     def __len__(self):
         return len(self._lru)
@@ -2120,22 +2121,14 @@ class LRUPromptCache:
                 )
 
                 if matched_hashes:
-                    # Load blocks from SSD and reconstruct KV cache
-                    all_blocks_cache = []
-                    for block_hash in matched_hashes:
-                        block_cache = self._block_ssd_cache.load_block(block_hash)
-                        if block_cache is None:
-                            # Block file missing or corrupted — abort chain
-                            logger.warning(
-                                f"Block {block_hash.hex()[:12]} in chain "
-                                f"missing, falling back to progressive scan"
-                            )
-                            break
-                        all_blocks_cache.append(block_cache)
+                    # Load all blocks from SSD in a single batch call
+                    all_block_caches = self._block_ssd_cache.load_blocks_batch(matched_hashes)
 
-                    if all_blocks_cache and len(all_blocks_cache) == len(matched_hashes):
+                    # Filter out None results (missing/corrupt blocks)
+                    valid_caches = [bc for bc in all_block_caches if bc is not None]
+                    if len(valid_caches) == len(matched_hashes):
                         # Merge blocks into a single cache list
-                        merged_cache = self._merge_block_caches(all_blocks_cache)
+                        merged_cache = self._merge_block_caches(valid_caches)
                         if merged_cache is not None:
                             # Cache the merged result in RAM trie for future hits
                             cached_tokens = tokens[:div_idx]
@@ -2385,65 +2378,103 @@ class LRUPromptCache:
         self, model_str: str, tokens: List[int], prompt_cache: List[Any]
     ) -> None:
         """
-        Save blocks from a full prompt_cache to the BlockSSDCache.
+        Queue block SSD save for later deferred batch processing.
 
-        Only saves FULL blocks (trailing partial block is NOT saved —
-        consistent with omlx behavior). This is called during insert_cache
-        when RAM entries are evicted or when we want to persist blocks
-        for cross-session reuse.
+        Instead of saving immediately (which triggers per-block GPU sync points
+        via mx.eval), defers to flush_pending_ssd_saves() which batches
+        ALL tensor evals into a single mx.eval() call.
         """
         if self._block_ssd_cache is None:
             return
+        self._pending_ssd_saves.append((model_str, tokens, prompt_cache))
 
+    def flush_pending_ssd_saves(self) -> None:
+        """
+        Process all queued SSD saves with a single batch mx.eval().
+
+        Deferred from _save_blocks_to_ssd() to move GPU sync points
+        out of the prefill hot path. For each pending save:
+         1. Compute block hashes and slice caches (lazy ops, no GPU sync)
+         2. Collect ALL tensors from ALL block caches
+         3. Call ONE mx.eval() to materialize everything
+         4. Save each block (tensor extraction is now a no-op eval)
+         5. Final flush + shrink once
+        """
+        if not self._pending_ssd_saves:
+            return
+
+        import mlx.core as mx
+        from mlx.utils import tree_flatten
         from mlx_lm.models.block_cache_utils import (
             slice_cache_for_block,
             get_cache_layer_info,
         )
-        from mlx_lm.models.block_ssd_cache import compute_block_hash
+        from mlx_lm.models.block_ssd_cache import compute_block_hash, BLOCK_SIZE
 
-        info = get_cache_layer_info(prompt_cache)
-
-        num_full_blocks = len(tokens) // BLOCK_SIZE
-        if num_full_blocks == 0:
-            return
-
-        parent_hash: Optional[bytes] = None
-
-        for block_idx in range(num_full_blocks):
-            start_tok = block_idx * BLOCK_SIZE
-            block_tokens = tokens[start_tok : start_tok + BLOCK_SIZE]
-
-            block_hash = compute_block_hash(parent_hash, block_tokens, model_str)
-
-            # Check if already cached (deduplication)
-            if self._block_ssd_cache.contains(block_hash):
-                parent_hash = block_hash
+        # Phase 1: Compute all block slices (lazy ops, no GPU sync)
+        block_tasks: List[Tuple[bytes, List[Any], Dict[str, str]]] = []
+        for model_str, tokens, prompt_cache in self._pending_ssd_saves:
+            info = get_cache_layer_info(prompt_cache)
+            num_full_blocks = len(tokens) // BLOCK_SIZE
+            if num_full_blocks == 0:
                 continue
 
-            # Slice the KV cache for this block
-            block_cache = slice_cache_for_block(
-                prompt_cache, start_tok, BLOCK_SIZE
-            )
+            parent_hash: Optional[bytes] = None
+            for block_idx in range(num_full_blocks):
+                start_tok = block_idx * BLOCK_SIZE
+                block_tokens = tokens[start_tok : start_tok + BLOCK_SIZE]
+                block_hash = compute_block_hash(parent_hash, block_tokens, model_str)
 
-            # Save to SSD
-            metadata = {
-                "model_name": model_str,
-                "num_layers": info["num_layers"],
-                "token_count": BLOCK_SIZE,
-                "layer_cache_types": info["layer_cache_types"],
-            }
+                # Deduplicate against already-cached blocks
+                if self._block_ssd_cache.contains(block_hash):
+                    parent_hash = block_hash
+                    continue
+
+                block_cache = slice_cache_for_block(
+                    prompt_cache, start_tok, BLOCK_SIZE
+                )
+                metadata = {
+                    "model_name": model_str,
+                    "num_layers": info["num_layers"],
+                    "token_count": BLOCK_SIZE,
+                    "layer_cache_types": info["layer_cache_types"],
+                }
+                block_tasks.append((block_hash, block_cache, metadata))
+                parent_hash = block_hash
+
+        # Clear the queue — all work is captured in block_tasks
+        self._pending_ssd_saves.clear()
+
+        if not block_tasks:
+            return
+
+        # Phase 2: Collect ALL tensors from ALL block caches for ONE big eval
+        all_tensors: List[mx.array] = []
+        for _, block_cache, _ in block_tasks:
+            for layer_cache in block_cache:
+                state = layer_cache.state
+                flat_state = tree_flatten(state)
+                for _, t in flat_state:
+                    if hasattr(t, "dtype") and hasattr(t, "shape"):
+                        all_tensors.append(t)
+
+        # Single batch eval — the whole optimization.
+        # Replaces ~120 per-block mx.eval() calls with one.
+        if all_tensors:
+            mx.eval(all_tensors)
+
+        # Phase 3: Save all blocks.
+        # _extract_cache_bytes will call mx.eval() again, but since
+        # all tensors are already evaluated it's a no-op.
+        for block_hash, block_cache, metadata in block_tasks:
             self._block_ssd_cache.save_block(block_hash, block_cache, metadata)
-            parent_hash = block_hash
 
             logger.debug(
-                f"Saved block {block_hash.hex()[:12]} "
-                f"(tokens {start_tok}-{start_tok + BLOCK_SIZE})"
+                f"Deferred save of block {block_hash.hex()[:12]} "
+                f"({metadata.get('token_count', '?')} tokens)"
             )
 
-        # Flush pending async writes then evict once.
-        # Deferred eviction prevents the thrashing bug where eager
-        # _maybe_evict() inside _write_block_sync removes blocks that
-        # were verified by contains() earlier in this loop.
+        # One flush + shrink for the whole batch
         self._block_ssd_cache.flush()
         self._block_ssd_cache.shrink()
 
