@@ -2098,6 +2098,12 @@ class LRUPromptCache:
         if can_trim_prompt_cache(prompt_cache):
             for prefix_len, entry in self._trie.pop_prefixes(model, tokens):
                 if entry.cache_type in ("system", "user"):
+                    # pop_prefixes destructively removed __value__ from this
+                    # trie node. Since we're preserving this checkpoint,
+                    # re-insert __value__ so the trie stays in sync with
+                    # the LRU — otherwise eviction later will hit a
+                    # KeyError('__value__') in _trie.pop().
+                    self._trie.add(model, tokens[:prefix_len], entry)
                     continue
                 self._n_bytes -= entry.nbytes
                 self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
