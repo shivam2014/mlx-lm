@@ -1469,11 +1469,13 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Create the token generator
         try:
+            _t0 = time.perf_counter()
             ctx, response = self.response_generator.generate(
                 request,
                 args,
                 progress_callback=keepalive_callback,
             )
+            _prefill_time = time.perf_counter() - _t0
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
@@ -1503,6 +1505,8 @@ class APIHandler(BaseHTTPRequestHandler):
         tokens = []
         token_logprobs = []
         top_tokens = []
+
+        _gen_start = time.perf_counter()
 
         try:
             for gen in response:
@@ -1602,6 +1606,16 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.write(response_json)
                 self.wfile.flush()
         finally:
+            _gen_time = time.perf_counter() - _gen_start
+            _prompt_tps = len(ctx.prompt) / _prefill_time
+            _gen_tps = len(tokens) / _gen_time if _gen_time > 0 else 0.0
+            _peak_mem = mx.get_peak_memory() / 1e9
+            logging.debug(
+                "PERF: prompt_tps=%.1f gen_tps=%.1f prompt_tok=%d gen_tok=%d "
+                "prefill=%.2fs gen=%.2fs peak_mem=%.2fGB",
+                _prompt_tps, _gen_tps, len(ctx.prompt), len(tokens),
+                _prefill_time, _gen_time, _peak_mem,
+            )
             ctx.stop()
 
     def completion_usage_response(
