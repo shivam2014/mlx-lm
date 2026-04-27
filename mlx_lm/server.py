@@ -1626,11 +1626,12 @@ class APIHandler(BaseHTTPRequestHandler):
             _prompt_tps = len(ctx.prompt) / _prefill_time if _prefill_time > 0 else 0.0
             _gen_tps = len(tokens) / _gen_time if _gen_time > 0 else 0.0
             _peak_mem = mx.get_peak_memory() / 1e9
+            _pref_tok = len(ctx.prompt) - ctx.prompt_cache_count
             logging.info(
                 "PERF: prompt_tps=%.1f gen_tps=%.1f prompt_tok=%d gen_tok=%d "
-                "prefill=%.2fs gen=%.2fs peak_mem=%.2fGB",
+                "prefill=%.2fs gen=%.2fs peak_mem=%.2fGB pref_tok=%d",
                 _prompt_tps, _gen_tps, len(ctx.prompt), len(tokens),
-                _prefill_time, _gen_time, _peak_mem,
+                _prefill_time, _gen_time, _peak_mem, _pref_tok,
             )
             ctx.stop()
 
