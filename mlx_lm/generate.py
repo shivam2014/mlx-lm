@@ -209,6 +209,19 @@ def setup_arg_parser():
         default=DEFAULT_QUANTIZED_KV_START,
     )
     parser.add_argument(
+        "--kv-boundary-layers",
+        help="Number of first/last KV cache layers to protect with higher V precision."
+        " Set to 0 to disable. (default: 2)",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--kv-boundary-bits",
+        help="Bit precision for boundary KV cache layers (default: (8,8)).",
+        type=lambda s: eval(s) if s.startswith("(") else int(s),
+        default=(8, 8),
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         help="A model to be used for speculative decoding.",
@@ -297,12 +310,22 @@ class GenerationResponse:
     finish_reason: Optional[str] = None
 
 
-def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
+def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits,
+                             kv_boundary_layers=0, kv_boundary_bits=None):
     if kv_bits is None:
         return
-    for e, c in enumerate(prompt_cache):
-        if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
-            prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
+    # Collect indices of actual KVCache entries (skip ArraysCache / linear attention)
+    kv_indices = [e for e, c in enumerate(prompt_cache)
+                  if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start]
+    # Determine which layers get boundary (higher) precision
+    kv_boundary_set = set()
+    if kv_boundary_layers > 0 and kv_boundary_bits is not None and len(kv_indices) > 0:
+        kv_boundary_set = set(kv_indices[:kv_boundary_layers])
+        kv_boundary_set.update(kv_indices[-kv_boundary_layers:])
+    for e in kv_indices:
+        c = prompt_cache[e]
+        bits = kv_boundary_bits if e in kv_boundary_set else kv_bits
+        prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=bits)
 
 
 def generate_step(
@@ -318,6 +341,8 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    kv_boundary_layers: int = 2,
+    kv_boundary_bits: Optional[Union[int, Tuple[int, int]]] = (8, 8),
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -344,6 +369,10 @@ def generate_step(
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
+        kv_boundary_layers (int): Number of first/last KVCache layers to protect with
+           higher V precision. Default: ``2`` (protects first 2 + last 2 KV-cache layers).
+        kv_boundary_bits (Optional[Union[int, Tuple[int, int]]]): Bit precision for boundary KV
+           cache layers. Tuple ``(k_bits, v_bits)`` for KVSplit. Default: ``(8, 8)``.
         prompt_progress_callback (Callable[[int, int], None]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
@@ -382,6 +411,8 @@ def generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
+        kv_boundary_layers=kv_boundary_layers,
+        kv_boundary_bits=kv_boundary_bits,
     )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -485,6 +516,8 @@ def speculative_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    kv_boundary_layers: int = 2,
+    kv_boundary_bits: Optional[Union[int, Tuple[int, int]]] = (8, 8),
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -510,6 +543,10 @@ def speculative_generate_step(
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
+        kv_boundary_layers (int): Number of first/last KVCache layers to protect with
+           higher V precision. Default: ``2`` (protects first 2 + last 2 KV-cache layers).
+        kv_boundary_bits (Optional[Union[int, Tuple[int, int]]]): Bit precision for boundary KV
+           cache layers. Tuple ``(k_bits, v_bits)`` for KVSplit. Default: ``(8, 8)``.
 
     Yields:
         Tuple[mx.array, mx.array, bool]: One token, a vector of log probabilities,
@@ -540,6 +577,8 @@ def speculative_generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
+        kv_boundary_layers=kv_boundary_layers,
+        kv_boundary_bits=kv_boundary_bits,
     )
 
     def _process_and_sample(tokens, logits):
@@ -2082,6 +2121,8 @@ def main():
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
+        kv_boundary_layers=args.kv_boundary_layers,
+        kv_boundary_bits=args.kv_boundary_bits,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )

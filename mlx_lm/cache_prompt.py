@@ -131,6 +131,8 @@ def main():
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
+        kv_boundary_layers=getattr(args, "kv_boundary_layers", 2),
+        kv_boundary_bits=getattr(args, "kv_boundary_bits", (8, 8)),
         prompt_progress_callback=callback,
     ):
         pass

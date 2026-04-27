@@ -983,6 +983,8 @@ class ResponseGenerator:
                 kv_kwargs["kv_bits"] = self.cli_args.kv_bits
                 kv_kwargs["kv_group_size"] = self.cli_args.kv_group_size
                 kv_kwargs["quantized_kv_start"] = self.cli_args.quantized_kv_start
+                kv_kwargs["kv_boundary_layers"] = self.cli_args.kv_boundary_layers
+                kv_kwargs["kv_boundary_bits"] = self.cli_args.kv_boundary_bits
 
             # Ensure MLX has a default Metal stream for this thread
             # (required before any MLX operation; avoids "no Stream in current thread" errors)
@@ -1952,6 +1954,19 @@ def main():
         type=int,
         default=0,
         help="Step to begin quantizing the KV cache (default: 0)",
+    )
+    parser.add_argument(
+        "--kv-boundary-layers",
+        type=int,
+        default=2,
+        help="Number of first/last KV cache layers to protect with higher V precision."
+        " Set to 0 to disable. (default: 2)",
+    )
+    parser.add_argument(
+        "--kv-boundary-bits",
+        type=lambda s: eval(s) if s.startswith("(") else int(s),
+        default=(8, 8),
+        help="Bit precision for boundary KV cache layers (default: (8,8))",
     )
     parser.add_argument(
         "--prompt-cache-size",
