@@ -2041,9 +2041,15 @@ class LRUPromptCache:
                 i += 1
             return lru_b.popleft()
 
-    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
+    def __init__(
+        self,
+        max_size: int = 10,
+        max_bytes: int = 1 << 63,
+        ssd_cache: Optional["SsdCache"] = None,
+    ):
         self.max_size = max_size
         self.max_bytes = max_bytes
+        self._ssd_cache = ssd_cache
         self._trie = PromptTrie()
         self._lru = LRUPromptCache.CacheOrder()
         self._n_bytes = 0
@@ -2075,6 +2081,25 @@ class LRUPromptCache:
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
             return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+
+        # SSD fallback: try progressively shorter prefixes on disk
+        if self._ssd_cache is not None:
+            model_str = str(model)
+            for i in range(len(tokens), 0, -1):
+                prefix = tokens[:i]
+                cache = self._ssd_cache.load_entry(model_str, prefix)
+                if cache is not None:
+                    # Restore into RAM trie
+                    entry = LRUPromptCache.CacheEntry(
+                        cache,
+                        sum(c.nbytes for c in cache),
+                        "user",  # conservative cache_type
+                    )
+                    self._trie.add(model, prefix, entry)
+                    self._n_bytes += entry.nbytes
+                    self._n_bytes_by_type[entry.cache_type] += entry.nbytes
+                    self._lru.push(model, prefix, entry.cache_type)
+                    return copy.deepcopy(cache), tokens[i:]
 
         return None, tokens
 
@@ -2123,11 +2148,15 @@ class LRUPromptCache:
         if len(self._lru) > self.max_size:
             model, tokens = self._lru.pop()
             entry = self._trie.pop(model, tokens)
+            if self._ssd_cache is not None and entry.prompt_cache:
+                self._ssd_cache.save_entry(str(model), tokens, entry.prompt_cache)
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
         while self._n_bytes > self.max_bytes:
             model, tokens = self._lru.pop()
             entry = self._trie.pop(model, tokens)
+            if self._ssd_cache is not None and entry.prompt_cache:
+                self._ssd_cache.save_entry(str(model), tokens, entry.prompt_cache)
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
 
@@ -2140,11 +2169,15 @@ class LRUPromptCache:
         while len(self._lru) > n_sequences:
             model, tokens = self._lru.pop()
             entry = self._trie.pop(model, tokens)
+            if self._ssd_cache is not None and entry.prompt_cache:
+                self._ssd_cache.save_entry(str(model), tokens, entry.prompt_cache)
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
         while self._n_bytes > n_bytes:
             model, tokens = self._lru.pop()
             entry = self._trie.pop(model, tokens)
+            if self._ssd_cache is not None and entry.prompt_cache:
+                self._ssd_cache.save_entry(str(model), tokens, entry.prompt_cache)
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
 
@@ -2156,6 +2189,19 @@ class LRUPromptCache:
                 "n_bytes": self._n_bytes_by_type[cache_type],
             }
         return result
+
+    def warm_from_ssd(self, n: int = 0):
+        """Warm RAM cache by loading SSD entries.
+
+        This is a placeholder for future enhancement. SSD entries are
+        loaded lazily on fetch miss in ``fetch_nearest_cache``, which
+        is sufficient for most use cases. A full warm-up would require
+        storing token sequences in SSD metadata for reconstruction.
+
+        Args:
+            n: Number of entries to load. 0 = all that fit within max_bytes.
+        """
+        pass
 
 
 @dataclass
