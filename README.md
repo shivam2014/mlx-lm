@@ -133,6 +133,50 @@ tokens. With the fixed SSD cache and hot cache warmup, the first request drops
 to 11.15 seconds (6.8x faster). The second request within the same session
 hits the RAM trie: 0.90 seconds (84x vs first request, 51x vs cold start).
 
+### Prompt Stability (Fix A + Fix B) — Hermes Agent Live Session
+
+**Date:** 2026-04-28 | **Branch:** fix/ssd-caching-prompt-break
+**Client:** Hermes Agent v0.11.0, default profile
+
+This benchmark verifies prompt byte-stability and SSD cache observability
+in a real multi-turn Hermes conversation across server restarts.
+
+**Run 1 — Cold cache (empty SSD):**
+
+```
+PERF: prompt_tok=29623  pref_tok=29623  prefill=85.01s  block_hit=0   chain_break=1
+```
+
+**Run 2 — SSD cache hit (fresh server, same prompt):**
+
+```
+PERF: prompt_tok=29624  pref_tok=3256   prefill=12.71s  block_hit=103  chain_break=0
+```
+
+| Metric | Run 1 (cold) | Run 2 (SSD hit) | Improvement |
+|---|---|---|---|
+| pref_tok | 29,623 | 3,256 | 89% cached |
+| block_hit | 0 | 103 | 103 blocks from SSD |
+| chain_break | 1 | 0 | Prompt byte-stable |
+| prefill | 85.01s | 12.71s | 6.7x faster |
+
+**Long conversation (8 requests, 29K → 47K tokens):**
+
+| prompt_tok | pref_tok | cached% | chain_break | prefill |
+|---|---|---|---|---|
+| 29,629 | 3,261 | 89% | 0 | 12.78s |
+| 33,019 | 3,360 | 90% | 0 | 13.22s |
+| 36,235 | 2,430 | 93% | 0 | 10.83s |
+| 39,943 | 3,318 | 92% | 0 | 15.01s |
+| 43,166 | 2,845 | 93% | 0 | 13.61s |
+| 47,165 | 3,672 | 92% | 0 | 17.83s |
+
+`chain_break=0` on all requests — the system prompt remained byte-stable
+throughout a long conversation. Prefill stays flat at ~13-18s despite the
+prompt growing from 29K to 47K tokens (only the delta is recomputed).
+
+Full benchmark data: [SSD_CACHE_BENCHMARK_FIX_ABC.md](SSD_CACHE_BENCHMARK_FIX_ABC.md)
+
 ### Server startup
 
 ```
