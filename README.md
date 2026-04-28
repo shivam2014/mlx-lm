@@ -43,7 +43,7 @@ pip install -e .
 
 ### Server Usage
 
-Basic server with SSD cache:
+Boundary protection is on by default (first/last 2 layers at 8-bit V). No extra flags needed.
 
 ```bash
 python3 -m mlx_lm server \
@@ -51,18 +51,6 @@ python3 -m mlx_lm server \
   --host 127.0.0.1 --port 8000 \
   --chat-template-args '{"enable_thinking": false}' \
   --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
-  --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
-  --block-ssd-cache-max-size 50 \
-  --prompt-cache-size 10
-```
-
-With boundary KV protection:
-
-```bash
-python3 -m mlx_lm server \
-  --model Qwen3.6-35B-A3B-UD-MLX-4bit \
-  --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
-  --kv-boundary-layers 2 --kv-boundary-bits "(8, 8)" \
   --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
   --block-ssd-cache-max-size 50 \
   --prompt-cache-size 10
