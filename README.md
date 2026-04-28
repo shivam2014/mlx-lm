@@ -217,14 +217,14 @@ mlx_lm.server \
   --prompt-cache-size 10
 ```
 
-| Flag | What it does | Why you want it |
-|------|-------------|-----------------|
-| `--kv-bits "(8, 4)"` | Keys at 8-bit, values at 4-bit | ~30% KV memory savings. Keys need precision (attention dot product), values tolerate compression (softmax-weighted sums). |
-| `--kv-group-size "(64, 32)"` | Separate group sizes for K and V | Smaller groups for V (32) compensate for lower bit-width. Keys use 64 for speed. |
-| `--kv-boundary-layers 2` | Protect first 2 + last 2 KV layers at K8+V8 | Boundary layers handle input projection and logit output — most sensitive to quantization noise. |
-| `--block-ssd-cache-dir` | Persist KV blocks to SSD | Survives server restarts. Without this, every restart recomputes the full system prompt from scratch. |
-| `--block-ssd-cache-max-size 50` | 50GB SSD cache limit | A 29K-token system prompt uses ~40GB in blocks. 50GB gives headroom for a few sessions. |
-| `--prompt-cache-size 10` | Keep 10 most-recent KV caches in RAM | Higher values use more RAM but reduce SSD round-trips. 10 is enough for typical agent sessions. |
+| Flag | Value | What it does | Why you want it |
+|------|-------|-------------|-----------------|
+| `--kv-bits` | `"(8, 4)"` | Keys at 8-bit, values at 4-bit | ~30% KV memory savings. Keys need precision (attention dot product), values tolerate compression (softmax-weighted sums). |
+| `--kv-group-size` | `"(64, 32)"` | Separate group sizes for K and V | Smaller groups for V (32) compensate for lower bit-width. Keys use 64 for speed. |
+| `--kv-boundary-layers` | `2` | Protect first 2 + last 2 KV layers at K8+V8 | Boundary layers handle input projection and logit output — most sensitive to quantization noise. |
+| `--block-ssd-cache-dir` | — | Persist KV blocks to SSD | Survives server restarts. Without this, every restart recomputes the full system prompt from scratch. |
+| `--block-ssd-cache-max-size` | `50` | SSD cache limit in GB | A 29K-token system prompt uses ~40GB in blocks. 50GB gives headroom for a few sessions. |
+| `--prompt-cache-size` | `10` | Keep N most-recent KV caches in RAM | Higher values use more RAM but reduce SSD round-trips. 10 is enough for typical agent sessions. |
 
 ---
 
