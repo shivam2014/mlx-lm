@@ -1660,7 +1660,7 @@ class APIHandler(BaseHTTPRequestHandler):
             _peak_mem = mx.get_peak_memory() / 1e9
             _pref_tok = len(ctx.prompt) - ctx.prompt_cache_count
             # Fix B: per-request SSD cache observability
-            _ssd_stats = self.prompt_cache.get_last_fetch_stats()
+            _ssd_stats = self.response_generator.prompt_cache.get_last_fetch_stats()
             logging.info(
                 "PERF: prompt_tps=%.1f gen_tps=%.1f prompt_tok=%d gen_tok=%d "
                 "prefill=%.2fs gen=%.2fs peak_mem=%.2fGB pref_tok=%d "
