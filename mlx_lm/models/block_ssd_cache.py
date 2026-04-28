@@ -200,12 +200,52 @@ def compute_block_hash(
     return h.digest()
 
 
+def compute_content_hash(
+    block_tokens: List[int],
+    model_name: str,
+    block_index: int,
+) -> bytes:
+    """
+    Compute a position-aware content hash for a block of tokens.
+
+    Unlike ``compute_block_hash``, this does NOT depend on the previous
+    block's hash. It only depends on:
+      1. model_name — prevents cross-model cache poisoning
+      2. block_index — encodes the block's position in the sequence,
+         ensuring we only match blocks at the exact same position
+         (critical: KV state at position N depends on attention to
+         all tokens 0..N-1, so a block at position 5 has different
+         KV state than the same content at position 10)
+      3. block_tokens — the actual token content
+
+    This enables content-based fallback in ``find_longest_block_chain``:
+    when a chain hash breaks (because a parent hash changed), blocks
+    AFTER the break that have the SAME content AT THE SAME POSITION
+    can still be located by their content hash for diagnostic purposes.
+
+    Args:
+        block_tokens: Token IDs in this block (up to BLOCK_SIZE).
+        model_name: Model identifier for cache isolation.
+        block_index: 0-based block position in the token sequence.
+
+    Returns:
+        32-byte SHA-256 digest.
+    """
+    h = hashlib.sha256()
+    h.update(b"mlx-lm-content-v1")
+    h.update(model_name.encode("utf-8"))
+    h.update(str(block_index).encode("utf-8"))
+    h.update(pickle.dumps(tuple(block_tokens)))
+    return h.digest()
+
+
 # ── Block metadata ─────────────────────────────────────────────────────────
 
 @dataclass
 class BlockMeta:
     """Metadata for one SSD-cached block."""
-    block_hash: bytes              # SHA-256 content hash (32 bytes)
+    block_hash: bytes              # SHA-256 chain hash (32 bytes) — depends on parent hash
+    content_hash: bytes            # SHA-256 content hash (32 bytes) — position-aware, no parent dep
     file_path: Path                # Full path to .safetensors file
     file_size: int                 # Bytes on disk (updated after write completes)
     token_count: int               # Typically 256; fewer for the very last block
@@ -260,7 +300,8 @@ class BlockSSDCache:
 
         # Core data structures (thread-safe)
         self._lock = threading.RLock()
-        self._index: Dict[bytes, BlockMeta] = {}       # hash → metadata
+        self._index: Dict[bytes, BlockMeta] = {}       # chain_hash → metadata
+        self._content_hash_index: Dict[bytes, bytes] = {}    # content_hash → chain_hash
         self._lru: OrderedDict[bytes, float] = OrderedDict()  # hash → last_access
         self._total_bytes: int = 0
 
@@ -288,6 +329,25 @@ class BlockSSDCache:
         """Check if a block with this hash exists on disk."""
         with self._lock:
             return block_hash in self._index
+
+    def contains_content_hash(self, content_hash: bytes) -> bool:
+        """Check if a block with this content hash exists in the index.
+
+        Unlike ``contains()`` which checks chain hashes, this checks the
+        position-aware content hash (independent of parent hash). Used for
+        content-based fallback when the chain breaks.
+        """
+        with self._lock:
+            return content_hash in self._content_hash_index
+
+    def chain_hash_for_content(self, content_hash: bytes) -> Optional[bytes]:
+        """Given a content hash, return the corresponding chain hash.
+
+        Returns None if no block has this content hash.
+        The chain hash can then be used with ``load_block()`` or ``contains()``.
+        """
+        with self._lock:
+            return self._content_hash_index.get(content_hash)
 
     def get_meta(self, block_hash: bytes) -> Optional[BlockMeta]:
         """Get block metadata without loading tensor data."""
@@ -617,6 +677,7 @@ class BlockSSDCache:
             "num_layers": str(metadata.get("num_layers", 0)),
             "token_count": str(metadata.get("token_count", 0)),
             "block_hash": block_hash.hex(),
+            "content_hash": metadata.get("content_hash", ""),
             "layer_cache_types": json.dumps(metadata.get("layer_cache_types", [])),
             # Store cache info and classes for metadata reconstruction
             "_cache_info": json.dumps(
@@ -717,6 +778,11 @@ class BlockSSDCache:
         safetensors_meta["_cache_classes"] = json.dumps(cache_classes_raw)
         meta = BlockMeta(
             block_hash=block_hash,
+            content_hash=(
+                bytes.fromhex(safetensors_meta["content_hash"])
+                if safetensors_meta.get("content_hash")
+                else b""
+            ),
             file_path=file_path,
             file_size=file_size,
             token_count=int(safetensors_meta.get("token_count", str(BLOCK_SIZE))),
@@ -746,6 +812,10 @@ class BlockSSDCache:
         Walk the token sequence from start_block, computing chain hashes and
         checking the SSD index. Return all matching block hashes and the index
         of the first token NOT covered by cached blocks.
+
+        When the chain breaks at a block, checks if a content-hash match exists
+        at that position. If found, logs a diagnostic so the caller can decide
+        whether to attempt content-based recovery in the future.
 
         Args:
             tokens: Full token sequence.
@@ -781,6 +851,51 @@ class BlockSSDCache:
                 parent_hash = block_hash
                 block_idx += 1
             else:
+                # Chain break — try content-based diagnostic lookup.
+                # If a content hash match exists at this position, it means
+                # the block's token content is identical to a previously cached
+                # block at the same position, but the chain hash differs because
+                # a parent block changed.
+                #
+                # This is diagnostic-only for now: loading by content hash is
+                # unsafe because the KV state depends on the full prefix chain.
+                # A future optimization could recompute the divergent prefix
+                # and then attempt to re-link using the content-hash match.
+                content_candidate = None
+                if hasattr(self, '_content_hash_index'):
+                    try:
+                        ch = compute_content_hash(
+                            block_tokens, model_name, block_idx
+                        )
+                        if ch in self._content_hash_index:
+                            content_candidate = self._content_hash_index[ch]
+                    except Exception:
+                        pass
+
+                if content_candidate is not None:
+                    # Count how many subsequent blocks also have content matches
+                    scan_limit = min(block_idx + 50, (len(tokens) + BLOCK_SIZE - 1) // BLOCK_SIZE)
+                    content_match_count = 0
+                    for scan_idx in range(block_idx + 1, scan_limit):
+                        s_start = scan_idx * BLOCK_SIZE
+                        s_end = min(s_start + BLOCK_SIZE, len(tokens))
+                        s_tokens = tokens[s_start:s_end]
+                        try:
+                            sch = compute_content_hash(s_tokens, model_name, scan_idx)
+                            if sch in self._content_hash_index:
+                                content_match_count += 1
+                        except Exception:
+                            break
+
+                    logger.info(
+                        f"BlockSSD content-hit at block {block_idx}: "
+                        f"chain hash differs but content matches cached block. "
+                        f"{content_match_count} subsequent blocks also have "
+                        f"content matches (would save up to "
+                        f"{(content_match_count + 1) * BLOCK_SIZE} tokens "
+                        f"with partial-prefill recovery)."
+                    )
+
                 break
 
         return matched_hashes, block_idx * BLOCK_SIZE
@@ -839,9 +954,15 @@ class BlockSSDCache:
             if existing is not None:
                 self._total_bytes -= existing.file_size
                 del self._lru[meta.block_hash]
+                # Remove old content hash mapping
+                if existing.content_hash and existing.content_hash in self._content_hash_index:
+                    del self._content_hash_index[existing.content_hash]
             self._index[meta.block_hash] = meta
             self._lru[meta.block_hash] = meta.last_access
             self._total_bytes += meta.file_size
+            # Index by content hash for content-based fallback lookups
+            if meta.content_hash:
+                self._content_hash_index[meta.content_hash] = meta.block_hash
 
     def _remove_from_index(self, block_hash: bytes) -> Optional[BlockMeta]:
         with self._lock:
@@ -849,6 +970,9 @@ class BlockSSDCache:
             if meta is not None:
                 self._lru.pop(block_hash, None)
                 self._total_bytes -= meta.file_size
+                # Clean up content hash mapping
+                if meta.content_hash and meta.content_hash in self._content_hash_index:
+                    del self._content_hash_index[meta.content_hash]
             return meta
 
     def _maybe_evict(self) -> None:
@@ -899,6 +1023,8 @@ class BlockSSDCache:
                             self._index[meta.block_hash] = meta
                             self._lru[meta.block_hash] = meta.last_access
                             self._total_bytes += meta.file_size
+                            if meta.content_hash:
+                                self._content_hash_index[meta.content_hash] = meta.block_hash
                 logger.info(
                     f"Loaded {len(self._index)} blocks "
                     f"({self._total_bytes / 1e9:.2f} GB) from index"
@@ -941,6 +1067,11 @@ class BlockSSDCache:
 
                 meta = BlockMeta(
                     block_hash=block_hash,
+                    content_hash=(
+                        bytes.fromhex(metadata_dict["content_hash"])
+                        if metadata_dict.get("content_hash")
+                        else b""
+                    ),
                     file_path=fpath,
                     file_size=stat.st_size,
                     token_count=int(metadata_dict.get("token_count", "256")),
@@ -958,6 +1089,8 @@ class BlockSSDCache:
                     self._index[block_hash] = meta
                     self._lru[block_hash] = meta.last_access
                     self._total_bytes += meta.file_size
+                    if meta.content_hash:
+                        self._content_hash_index[meta.content_hash] = block_hash
                 count += 1
             except Exception as e:
                 logger.debug(f"Skipping {fpath.name}: {e}")
@@ -976,6 +1109,7 @@ class BlockSSDCache:
     def _meta_to_dict(meta: BlockMeta) -> Dict[str, Any]:
         return {
             "block_hash": meta.block_hash.hex(),
+            "content_hash": meta.content_hash.hex() if meta.content_hash else "",
             "file_path": str(meta.file_path),
             "file_size": meta.file_size,
             "token_count": meta.token_count,
@@ -990,6 +1124,11 @@ class BlockSSDCache:
     def _dict_to_meta(d: Dict[str, Any]) -> BlockMeta:
         return BlockMeta(
             block_hash=bytes.fromhex(d["block_hash"]),
+            content_hash=(
+                bytes.fromhex(d["content_hash"])
+                if d.get("content_hash")
+                else b""
+            ),
             file_path=Path(d["file_path"]),
             file_size=d["file_size"],
             token_count=d["token_count"],

@@ -23,6 +23,7 @@ from mlx_lm.models.block_ssd_cache import (
     BLOCK_SIZE,
     BlockSSDCache,
     compute_block_hash,
+    compute_content_hash,
     DEFAULT_ROOT_HASH,
 )
 
@@ -2151,6 +2152,31 @@ class LRUPromptCache:
                                 f"{div_idx} tokens from SSD"
                             )
                             return merged_cache, tokens[div_idx:]
+                else:
+                        # Chain break: block 0 doesn't match anything in the index.
+                        # The system prompt content at the very beginning changed.
+                        index_block_count = self._block_ssd_cache.block_count
+                        if index_block_count > 0:
+                            # Decode the first tokens to show what text is new
+                            preamble_text = ""
+                            try:
+                                if self._hermes_optimizer is not None:
+                                    tok = getattr(self._hermes_optimizer, '_tokenizer', None)
+                                    if tok is not None:
+                                        preamble_text = tok.decode(tokens[:min(64, len(tokens))])[:300]
+                            except Exception:
+                                pass
+                            logger.warning(
+                                f"BlockSSD chain break at block 0: "
+                                f"{len(tokens)} tokens in prompt, "
+                                f"{index_block_count} blocks in SSD index. "
+                                f"System prompt prefix text changed. "
+                                f"First 64 token IDs: {list(tokens[:min(64, len(tokens))])}"
+                            )
+                            if preamble_text:
+                                logger.warning(
+                                    f"New system prompt start: {preamble_text!r}"
+                                )
 
             except Exception as e:
                 logger.warning(
@@ -2415,7 +2441,7 @@ class LRUPromptCache:
             slice_cache_for_block,
             get_cache_layer_info,
         )
-        from mlx_lm.models.block_ssd_cache import compute_block_hash, BLOCK_SIZE
+        from mlx_lm.models.block_ssd_cache import compute_block_hash, compute_content_hash, BLOCK_SIZE
 
         # Phase 1: Compute all block slices (lazy ops, no GPU sync)
         block_tasks: List[Tuple[bytes, List[Any], Dict[str, str]]] = []
@@ -2430,6 +2456,7 @@ class LRUPromptCache:
                 start_tok = block_idx * BLOCK_SIZE
                 block_tokens = tokens[start_tok : start_tok + BLOCK_SIZE]
                 block_hash = compute_block_hash(parent_hash, block_tokens, model_str)
+                content_hash = compute_content_hash(block_tokens, model_str, block_idx)
 
                 # Deduplicate against already-cached blocks
                 if self._block_ssd_cache.contains(block_hash):
@@ -2444,6 +2471,7 @@ class LRUPromptCache:
                     "num_layers": info["num_layers"],
                     "token_count": BLOCK_SIZE,
                     "layer_cache_types": info["layer_cache_types"],
+                    "content_hash": content_hash.hex(),
                 }
                 block_tasks.append((block_hash, block_cache, metadata))
                 parent_hash = block_hash
