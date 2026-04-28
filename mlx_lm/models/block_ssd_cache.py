@@ -208,20 +208,36 @@ def compute_content_hash(
     """
     Compute a position-aware content hash for a block of tokens.
 
+    Fix C — Diagnostic hash only.
+
+    SAFETY NOTE: This hash is for diagnostics and exact-position lookup,
+    NOT for general KV cache reuse.  Why? Because the KV state at position
+    N is the product of every token from 0..N-1 attending through every
+    layer.  Two blocks with identical token content at different positions
+    have different attention context and therefore different KV states.
+    Reusing one in place of the other would silently corrupt inference.
+
+    SAFE uses:
+      - Diagnostic logging: "how many blocks at position N were unchanged?"
+      - Exact-position lookup: same block_index + same tokens = same KV
+      - Content-hash index for reverse lookups (content_hash -> chain_hash)
+
+    UNSAFE uses:
+      - Cross-position reuse: content at block 5 != KV at block 10
+      - Prefix reconstruction: inserting content-matched blocks into a
+        different chain without recomputing attention from the divergence
+
     Unlike ``compute_block_hash``, this does NOT depend on the previous
     block's hash. It only depends on:
       1. model_name — prevents cross-model cache poisoning
       2. block_index — encodes the block's position in the sequence,
          ensuring we only match blocks at the exact same position
-         (critical: KV state at position N depends on attention to
-         all tokens 0..N-1, so a block at position 5 has different
-         KV state than the same content at position 10)
       3. block_tokens — the actual token content
 
-    This enables content-based fallback in ``find_longest_block_chain``:
+    This enables content-based diagnostics in ``find_longest_block_chain``:
     when a chain hash breaks (because a parent hash changed), blocks
     AFTER the break that have the SAME content AT THE SAME POSITION
-    can still be located by their content hash for diagnostic purposes.
+    can still be located by their content hash for investigation.
 
     Args:
         block_tokens: Token IDs in this block (up to BLOCK_SIZE).
@@ -301,6 +317,9 @@ class BlockSSDCache:
         # Core data structures (thread-safe)
         self._lock = threading.RLock()
         self._index: Dict[bytes, BlockMeta] = {}       # chain_hash → metadata
+        # Fix C: content_hash -> chain_hash reverse index.
+        # Used for diagnostics and exact-position lookups only.
+        # NOT safe for cross-position KV reuse (see compute_content_hash safety note).
         self._content_hash_index: Dict[bytes, bytes] = {}    # content_hash → chain_hash
         self._lru: OrderedDict[bytes, float] = OrderedDict()  # hash → last_access
         self._total_bytes: int = 0
@@ -334,8 +353,12 @@ class BlockSSDCache:
         """Check if a block with this content hash exists in the index.
 
         Unlike ``contains()`` which checks chain hashes, this checks the
-        position-aware content hash (independent of parent hash). Used for
-        content-based fallback when the chain breaks.
+        position-aware content hash (independent of parent hash).
+
+        SAFETY: This lookup is position-locked — a content hash encodes
+        block_index, so matching here means same position + same tokens.
+        Do NOT use to find "similar" blocks at different positions.
+        See ``compute_content_hash`` safety note.
         """
         with self._lock:
             return content_hash in self._content_hash_index

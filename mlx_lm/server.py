@@ -1659,11 +1659,17 @@ class APIHandler(BaseHTTPRequestHandler):
             _gen_tps = len(tokens) / _gen_time if _gen_time > 0 else 0.0
             _peak_mem = mx.get_peak_memory() / 1e9
             _pref_tok = len(ctx.prompt) - ctx.prompt_cache_count
+            # Fix B: per-request SSD cache observability
+            _ssd_stats = self.prompt_cache.get_last_fetch_stats()
             logging.info(
                 "PERF: prompt_tps=%.1f gen_tps=%.1f prompt_tok=%d gen_tok=%d "
-                "prefill=%.2fs gen=%.2fs peak_mem=%.2fGB pref_tok=%d",
+                "prefill=%.2fs gen=%.2fs peak_mem=%.2fGB pref_tok=%d "
+                "block_hit=%d block_write=%d chain_break=%d",
                 _prompt_tps, _gen_tps, len(ctx.prompt), len(tokens),
                 _prefill_time, _gen_time, _peak_mem, _pref_tok,
+                _ssd_stats.get("block_hit_blocks", 0),
+                _ssd_stats.get("blocks_written", 0),
+                int(_ssd_stats.get("chain_break", False)),
             )
             ctx.stop()
 

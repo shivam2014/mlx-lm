@@ -2067,6 +2067,17 @@ class LRUPromptCache:
         self._n_bytes = 0
         self._n_bytes_by_type = {k: 0 for k in self._lru._ordering}
         self._pending_ssd_saves: List[Tuple[str, List[int], List[Any]]] = []
+        # Per-request SSD cache observability (Fix B).
+        # Reset at the start of each fetch_nearest_cache() call,
+        # read by server.py at the end of the request.
+        self._last_fetch_stats: Dict[str, Any] = {
+            "block_hit_blocks": 0,
+            "block_hit_tokens": 0,
+            "blocks_written": 0,
+            "chain_break": False,
+            "trie_hit": False,
+        }
+
 
     def __len__(self):
         return len(self._lru)
@@ -2085,8 +2096,17 @@ class LRUPromptCache:
         self._hermes_optimizer = optimizer
 
     def fetch_nearest_cache(self, model: Any, tokens: List[int]):
+        # Reset per-request observability counters (Fix B)
+        self._last_fetch_stats = {
+            'block_hit_blocks': 0,
+            'block_hit_tokens': 0,
+            'blocks_written': 0,
+            'chain_break': False,
+            'trie_hit': False,
+        }
         result = self._trie.search(model, tokens)
         if result.exact is not None:
+            self._last_fetch_stats['trie_hit'] = True
             cache_entry = self._trie.get(result.model, result.exact)
             return copy.deepcopy(cache_entry.prompt_cache), []
 
@@ -2094,6 +2114,7 @@ class LRUPromptCache:
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
             if can_trim_prompt_cache(cache_entry.prompt_cache):
+                self._last_fetch_stats['trie_hit'] = True
                 cache = copy.deepcopy(cache_entry.prompt_cache)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
@@ -2101,6 +2122,7 @@ class LRUPromptCache:
                 return cache, tokens[prefix:]
 
         if short_length > 0:
+            self._last_fetch_stats['trie_hit'] = True
             cache_entry = self._trie.get(result.model, result.shorter)
             return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
 
@@ -2122,6 +2144,8 @@ class LRUPromptCache:
                 )
 
                 if matched_hashes:
+                    self._last_fetch_stats['block_hit_blocks'] = len(matched_hashes)
+                    self._last_fetch_stats['block_hit_tokens'] = div_idx
                     # Load all blocks from SSD in a single batch call
                     all_block_caches = self._block_ssd_cache.load_blocks_batch(matched_hashes)
 
@@ -2153,6 +2177,7 @@ class LRUPromptCache:
                             )
                             return merged_cache, tokens[div_idx:]
                 else:
+                        self._last_fetch_stats['chain_break'] = True
                         # Chain break: block 0 doesn't match anything in the index.
                         # The system prompt content at the very beginning changed.
                         index_block_count = self._block_ssd_cache.block_count
@@ -2406,6 +2431,20 @@ class LRUPromptCache:
 
         return merged
 
+
+    def get_last_fetch_stats(self) -> Dict[str, Any]:
+        """Return per-request SSD cache observability stats.
+
+        Called by server.py after each request to populate the PERF log.
+        Returns a dict with keys:
+          - block_hit_blocks: blocks loaded from SSD this request
+          - block_hit_tokens: tokens covered by SSD blocks
+          - blocks_written: new blocks persisted to SSD this request
+          - chain_break: True if block-0 prefix mismatch was detected
+          - trie_hit: True if the RAM trie matched before SSD lookup
+        """
+        return dict(self._last_fetch_stats)
+
     def _save_blocks_to_ssd(
         self, model_str: str, tokens: List[int], prompt_cache: List[Any]
     ) -> None:
@@ -2478,6 +2517,9 @@ class LRUPromptCache:
 
         # Clear the queue — all work is captured in block_tasks
         self._pending_ssd_saves.clear()
+
+        # Record how many new blocks were written this flush cycle (Fix B)
+        self._last_fetch_stats['blocks_written'] = len(block_tasks)
 
         if not block_tasks:
             return
