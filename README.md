@@ -151,14 +151,13 @@ Full benchmark results: [SSD_CACHE_BENCHMARK_RESULTS.md](SSD_CACHE_BENCHMARK_RES
 CLI Flags
 ---------
 
-| Flag | Default | Description |
+| Flag | Recommended | Description |
 |------|---------|-------------|
-| `--kv-bits` | `8` | KV cache bit-width: int (uniform) or tuple (key,value) |
-| `--kv-group-size` | `64` | Quantization group size: int or tuple (key,value) |
-| `--quantized-kv-start` | `0` | Token offset to start quantization |
+| `--kv-bits` | `(8, 4)` | KV cache bit-width: int (uniform) or tuple (key,value) |
+| `--kv-group-size` | `(64, 32)` | Quantization group size: int or tuple (key,value) |
 | `--kv-boundary-layers` | `2` | Number of boundary KV layers to protect (0=disable) |
 | `--kv-boundary-bits` | `(8,8)` | Bit-width for boundary layers |
-| `--block-ssd-cache-dir` | `None` | Directory for SSD-persisted block cache |
+| `--block-ssd-cache-dir` | `/path/to/cache/dir` | Directory for SSD-persisted block cache |
 | `--block-ssd-cache-max-size` | `50` | Max SSD cache size in GB |
 | `--prompt-cache-size` | `10` | Number of cache entries in RAM |
 
