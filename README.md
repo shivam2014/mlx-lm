@@ -1,3 +1,99 @@
+## MLX LM — shivam94 fork
+
+Fork of [mlx-explore/mlx-lm](https://github.com/ml-explore/mlx-lm) with SSD-backed KV cache, boundary-aware KV quantization, live prefill metrics, and Hermes prefix optimizer for agent workloads.
+
+### Features added in this fork
+
+**Block-Level SSD KV Cache** (`--block-ssd-cache-dir`, `--block-ssd-cache-max-size`)
+- Disk-backed KV cache tier for cross-session persistence
+- Two-tier: in-memory LRU hot cache + SSD block storage
+- Hot cache warm-up at startup (loads 64 most-recent blocks from SSD to RAM)
+- Chain-hash-based block addressing (256 tokens per block)
+- Async deferred writes (saves coalesced to post-request)
+- 6.8x prefill speedup on cross-session first request
+- ~51x prefill speedup vs cold start at steady state
+
+**Boundary-Aware KV Cache Quantization** (`--kv-boundary-layers`, `--kv-boundary-bits`)
+- Per-layer bit precision: protects first/last KV layers with higher V precision
+- Default: 2 boundary layers at (8,8), middle layers at configured (k,v) bits
+- Compatible with existing `--kv-bits`, `--kv-group-size` flags
+
+**Performance Metrics**
+- PERF log line per request: `prompt_tps`, `gen_tps`, `peak_memory`, `pref_tok`
+- `pref_tok` shows real uncached tokens (prompt cache hit transparency)
+- Live tqdm prefill progress bar (borrowed from mlx-vlm pattern)
+
+**Hermes Prefix Optimizer**
+- System prompt prefix caching for agent/Hermes agent workloads
+- Optimizes the common case: repeated system prompt across requests
+
+**Bug Fixes**
+- CachePy trie `pop_prefixes` preserves intermediate checkpoints (system/user re-insertion)
+- Response truncation with non-zero truncation count
+- Default `max_tokens` set to -1 (unlimited) when client omits the parameter
+- `ArraysCache.is_trimmable` fix (inverted hasattr workaround)
+
+### Installation
+
+```bash
+git clone https://github.com/shivam2014/mlx-lm.git
+cd mlx-lm
+pip install -e .
+```
+
+### Server Usage
+
+Basic server with SSD cache:
+
+```bash
+python3 -m mlx_lm server \
+  --model Qwen3.6-35B-A3B-UD-MLX-4bit \
+  --host 127.0.0.1 --port 8000 \
+  --chat-template-args '{"enable_thinking": false}' \
+  --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
+  --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
+  --block-ssd-cache-max-size 50 \
+  --prompt-cache-size 10
+```
+
+With boundary KV protection:
+
+```bash
+python3 -m mlx_lm server \
+  --model Qwen3.6-35B-A3B-UD-MLX-4bit \
+  --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
+  --kv-boundary-layers 2 --kv-boundary-bits "(8, 8)" \
+  --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
+  --block-ssd-cache-max-size 50 \
+  --prompt-cache-size 10
+```
+
+### Benchmark Results
+
+**Model:** Qwen3.6-35B-A3B-UD-MLX-4bit | **Hardware:** M1 Max 64GB | **Context:** ~27K tokens (system prompt + tool definitions)
+
+| Config | Wall Clock | Eff. tok/s | Tokens Cached | Cached % |
+|---|---|---|---|---|
+| No cache (baseline) | 75.76s | 355.9 | 0 | 0% |
+| SSD + warm hot cache (1st request) | 11.15s | 2,418.6 | 24,064 | 89% |
+| Within-session RAM (2nd request) | 0.90s | 30,101 | 26,943 | 99.9% |
+
+SSD cache transforms cross-session prefill from 84.9s (cold) to 12.7s (warm) — 6.7x faster on first request. Subsequent requests within a session benefit from the in-memory hot cache, reaching ~18K prompt_tps at steady state (51x vs cold).
+
+Full benchmark results: [SSD_CACHE_BENCHMARK_RESULTS.md](SSD_CACHE_BENCHMARK_RESULTS.md)
+
+### Attribution
+
+This fork is based on [mlx-explore/mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple Inc. (Copyright © 2023-2025 Apple Inc.). All upstream code retains its original copyright.
+
+The live tqdm prefill progress bar implementation borrows the pattern from [mlx-vlm](https://github.com/ml-explore/mlx-vlm)'s `generate.py`.
+
+All new files (`block_ssd_cache.py`, `block_cache_utils.py`, `hermes_prefix_cache.py`, test files) are original contributions to this fork.
+
+---
+
+*Below this line is the upstream README from [mlx-explore/mlx-lm](https://github.com/ml-explore/mlx-lm).*
+
 ## MLX LM 
 
 MLX LM is a Python package for generating text and fine-tuning large language
