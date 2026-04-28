@@ -1908,6 +1908,14 @@ def run(
             f"Block SSD Cache: {n_blocks} blocks, {total_gb:.2f} GB "
             f"(max: {block_ssd_cache_max_size:.0f} GB) at {block_ssd_cache_dir}"
         )
+        # Pre-load recently-used blocks into hot cache so the first
+        # request hits hot memory instead of cold SSD (which is slower
+        # than recomputing).  64 blocks ≈ 16K tokens of prefix.
+        warm_count = min(64, n_blocks)
+        if warm_count > 0:
+            logging.info(f"Warming hot cache with {warm_count} most-recent blocks...")
+            loaded = block_ssd_cache.warm_hot_cache(warm_count)
+            logging.info(f"Hot cache warmed: {loaded} blocks loaded")
 
     prompt_cache = LRUPromptCache(
         cli_args.prompt_cache_size,

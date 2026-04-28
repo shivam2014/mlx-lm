@@ -785,6 +785,47 @@ class BlockSSDCache:
 
         return matched_hashes, block_idx * BLOCK_SIZE
 
+    def warm_hot_cache(self, n: int = 64) -> int:
+        """
+        Pre-load the n most recently accessed blocks from SSD into the hot cache.
+
+        This should be called at server startup, before any requests arrive,
+        so that the first request finds blocks already in memory instead of
+        loading them from SSD during prefill (which is slower than recompute).
+
+        Returns the number of blocks actually loaded.
+        """
+        if n <= 0:
+            return 0
+
+        loaded = 0
+        # Get the n most recently accessed blocks from the index
+        # (sorted by last_access descending)
+        with self._lock:
+            sorted_blocks = sorted(
+                self._index.values(),
+                key=lambda m: m.last_access,
+                reverse=True,
+            )
+
+        for meta in sorted_blocks[:n]:
+            try:
+                block_cache = self.load_block(meta.block_hash)
+                if block_cache is not None:
+                    # load_block already populates the hot cache,
+                    # so we just need to call it to warm it.
+                    loaded += 1
+            except Exception:
+                # Skip blocks that fail to load — they'll be recomputed
+                pass
+
+        if loaded > 0:
+            logger.info(
+                f"Warmed hot cache with {loaded}/{n} blocks "
+                f"from SSD (total index: {len(self._index)})"
+            )
+        return loaded
+
     # ── Internal helpers ────────────────────────────────────────────
 
     def _block_path(self, block_hash: bytes) -> Path:

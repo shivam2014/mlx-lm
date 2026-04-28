@@ -2130,11 +2130,15 @@ class LRUPromptCache:
                         # Merge blocks into a single cache list
                         merged_cache = self._merge_block_caches(valid_caches)
                         if merged_cache is not None:
-                            # Cache the merged result in RAM trie for future hits
+                            # Cache the merged result in RAM trie for future hits.
+                            # Deep copy for the trie (protected from caller mutations)
+                            # and return the original — avoids deep-copying the
+                            # full merged result twice on the return path.
                             cached_tokens = tokens[:div_idx]
+                            trie_cache = copy.deepcopy(merged_cache)
                             entry = LRUPromptCache.CacheEntry(
-                                merged_cache,
-                                sum(c.nbytes for c in merged_cache),
+                                trie_cache,
+                                sum(c.nbytes for c in trie_cache),
                                 "system",  # System prompt blocks
                             )
                             self._trie.add(model, cached_tokens, entry)
@@ -2146,7 +2150,7 @@ class LRUPromptCache:
                                 f"BlockSSDCache HIT: {len(matched_hashes)} blocks, "
                                 f"{div_idx} tokens from SSD"
                             )
-                            return copy.deepcopy(merged_cache), tokens[div_idx:]
+                            return merged_cache, tokens[div_idx:]
 
             except Exception as e:
                 logger.warning(
@@ -2360,8 +2364,11 @@ class LRUPromptCache:
                 merged_keys = mx.concatenate(all_keys, axis=2)
                 merged_values = mx.concatenate(all_values, axis=2)
 
-                import copy
-                merged_layer = copy.deepcopy(first_cache)
+                # Reuse the first block's layer object: replace its state
+                # and offset in-place.  Blocks from load_blocks_batch are
+                # already unique copies (deep-copied from hot cache or
+                # freshly deserialized from disk), so no sharing risk.
+                merged_layer = first_cache
                 merged_layer.state = (merged_keys, merged_values)
                 merged_layer.offset = total_tokens
                 merged.append(merged_layer)
@@ -2369,8 +2376,7 @@ class LRUPromptCache:
             elif layer_type in ("boundary_only", "unknown"):
                 # Only the LAST block's state is valid for non-sliceable layers
                 last_block = block_caches[-1][layer_idx]
-                import copy
-                merged.append(copy.deepcopy(last_block))
+                merged.append(last_block)
 
         return merged
 
