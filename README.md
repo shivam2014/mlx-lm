@@ -113,37 +113,6 @@ On server startup, the 64 most-recent blocks are pre-loaded from SSD into an
 in-memory LRU hot cache in ~52ms. This transforms the first request from cold
 SSD I/O (~150 tok/s, 34 sequential reads) to hot memory lookup (~2,400 tok/s).
 
-### Performance bug fixes (4 critical issues)
-
-The initial SSD cache implementation had four performance bugs that caused
-prefill to regress from ~650 tok/s (baseline) to 4.5 tok/s on cache hit.
-All fixed:
-
-**Fix 1 — Hot/in-memory LRU block cache.** The original `load_block()` hit
-disk on every call via `load_prompt_cache()`. A 34-block SSD hit meant 34
-sequential disk reads + deserialization during the prefill hot path. Fixed by
-adding an LRU `_hot_cache` dict that keeps deserialized blocks in memory and
-promotes on SSD load. (Commit `4a58354`)
-
-**Fix 2 — mx.eval() GPU sync per block during save.** `_extract_cache_bytes()`
-called `mx.eval()` per block. For 120 blocks, that was 120 GPU
-synchronization points stalling the Metal pipeline. Fixed by deferring SSD
-saves to post-request, batching all tensors, and running a single `mx.eval()`
-before extracting bytes for all blocks. (Commit `4154495`)
-
-**Fix 3 — copy.deepcopy() per layer per block.** `slice_cache_for_block()`
-deep-copied every `boundary_only` and `unknown` layer for each of 120 blocks.
-For a 90-layer model, that's ~10,800 deep copies. Fixed by eliminating
-redundant deep copies: blocks loaded from disk are already unique copies, so
-merging can reuse them in-place. (Commit `9627d30`)
-
-**Fix 4 — load_prompt_cache() overhead.** Block load used
-`load_prompt_cache()` which includes metadata reconstruction, cache class
-instantiation, and compatibility layers. Replaced with direct `mx.load()` +
-`_reconstruct_cache_data()` following the omlx pattern. (Commit `4a58354`)
-
-**Net effect:** 66% reduction in deep copies (279 -> 95 copies per block
-batch), zero GPU syncs during prefill save path, ~2x faster per-block load.
 
 ### Eviction thrashing fix
 
