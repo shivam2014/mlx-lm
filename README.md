@@ -8,29 +8,22 @@ Fork of [mlx-explore/mlx-lm](https://github.com/ml-explore/mlx-lm) with SSD-back
 - Disk-backed KV cache tier for cross-session persistence
 - Two-tier: in-memory LRU hot cache + SSD block storage
 - Hot cache warm-up at startup (loads 64 most-recent blocks from SSD to RAM)
-- Chain-hash-based block addressing (256 tokens per block)
-- Async deferred writes (saves coalesced to post-request)
-- 6.8x prefill speedup on cross-session first request
-- ~51x prefill speedup vs cold start at steady state
+- Chain-hash-based block addressing (256 tokens per block), async deferred writes
+- 6.8x prefill speedup on cross-session first request, ~51x vs cold start at steady state
 
 **Boundary-Aware KV Cache Quantization** (`--kv-boundary-layers`, `--kv-boundary-bits`)
-- Per-layer bit precision: protects first/last KV layers with higher V precision
-- Default: 2 boundary layers at (8,8), middle layers at configured (k,v) bits
-- Compatible with existing `--kv-bits`, `--kv-group-size` flags
-
-**Performance Metrics**
-- PERF log line per request: `prompt_tps`, `gen_tps`, `peak_memory`, `pref_tok`
-- `pref_tok` shows real uncached tokens (prompt cache hit transparency)
-- Live tqdm prefill progress bar (borrowed from mlx-vlm pattern)
+- Per-layer bit precision: first/last N layers get higher V precision
+- Default: 2 boundary layers at (8,8), middle layers at whatever `--kv-bits` specifies
+- Protects against quality degradation in position-sensitive layers. On by default.
 
 **Hermes Prefix Optimizer**
-- System prompt prefix caching for agent/Hermes agent workloads
-- Optimizes the common case: repeated system prompt across requests
+- System prompt prefix caching for agent workloads
+- Ensures the system prompt stays pinned in cache across multi-turn conversations
 
 **Bug Fixes**
 - CachePy trie `pop_prefixes` preserves intermediate checkpoints (system/user re-insertion)
 - Response truncation with non-zero truncation count
-- Default `max_tokens` set to -1 (unlimited) when client omits the parameter
+- Default `max_tokens` = -1 (unlimited) when client omits the parameter
 - `ArraysCache.is_trimmable` fix (inverted hasattr workaround)
 
 ### Installation
