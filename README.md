@@ -97,16 +97,6 @@ fetch_nearest_cache(model, tokens)
         Miss -> return None (create fresh)
 ```
 
-### Block addressing
-
-Cache is split into 256-token blocks, chained via hash:
-`SHA256(parent_hash || model_key || block_tokens)`. Each block stored as a
-safetensors file with two-char hash prefix subdirectory layout to avoid
-flat-directory explosion. The chain hash means any token change invalidates
-all subsequent blocks — the Hermes system prompt reordering (Phase 1, see
-docs) addresses this by placing dynamic sections (memory, timestamp) at the
-end.
-
 ### Hot cache warm-up
 
 On server startup, the 64 most-recent blocks are pre-loaded from SSD into an
@@ -114,70 +104,6 @@ in-memory LRU hot cache in ~52ms. This transforms the first request from cold
 SSD I/O (~150 tok/s, 34 sequential reads) to hot memory lookup (~2,400 tok/s).
 
 
-### Eviction thrashing fix
-
-The original `_save_blocks_to_ssd()` called `_maybe_evict()` eagerly on every
-single block save. When the cache hit its size limit during a batch save,
-eviction removed blocks that had already been verified as present by
-`contains()` earlier in the same loop — creating holes in the block chain and
-rendering the cache useless for subsequent requests.
-
-Fixed by deferring eviction to end-of-batch: `save_block()` only indexes,
-`shrink()` runs once after all blocks are saved. (Commit `6726f33`)
-
----
-
-Prefill Cache Instrumentation
------------------------------
-
-### Actual prefill wall time (was: queue round-trip)
-
-`_prefill_time` was measured from `generate()` call to return, which captured
-queue round-trip time (~0.18s for 28K tokens) rather than actual prefill wall
-time (~40s). Both the single-request and batch paths put context on the
-response queue BEFORE prefill starts.
-
-Fixed by using the `keepalive_callback` closure (already wired for SSE
-keepalive) to measure actual prefill: record `perf_counter` when prefill
-starts (tqdm bar first appears), compute elapsed when `processed >= total`
-(prefill completes). (Commit `580b9a5`)
-
-### Live tqdm prefill bar
-
-Replaced the text-based `Prompt processing progress: {processed}/{total}`
-INFO log line with a live tqdm progress bar writing to stderr, borrowing the
-pattern from mlx-vlm's `generate.py`. SSE keepalive messages are preserved to
-keep the HTTP connection alive during long prefill. (Commit `383e694`)
-
-### Per-request performance metrics
-
-Each request now logs at INFO level:
-
-```
-PERF: prompt_tps=2418.6 gen_tps=0.2 prompt_tok=26958 gen_tok=2
-      prefill=11.15s gen=11.42s peak_mem=24.81GB pref_tok=2894
-```
-
-`pref_tok` shows real uncached tokens (prompt_tok - cached_tokens), so at a
-glance you see how many tokens were actually processed by the model vs served
-from cache. (Commits `87536ee`, `0489b7c`)
-
----
-
-Bug Fixes
----------
-
-- **CachePy trie `pop_prefixes`** — Destructively popped `__value__` before
-  `cache_type` check, causing silent context corruption in multi-turn
-  conversations. Fixed by re-inserting system/user entries via `_trie.add()`.
-- **Default `max_tokens`** — Upstream default was 512, which truncated
-  responses when clients omitted the parameter. Changed to -1 (unlimited).
-- **`ArraysCache.is_trimmable`** — Inverted `hasattr` workaround caused
-  incorrect feature detection for multimodal ArraysCache compatibility.
-- **Response truncation** — Non-zero truncation count lost final tokens of
-  generation.
-
----
 
 Benchmarks
 ----------
