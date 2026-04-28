@@ -153,6 +153,8 @@ grep "PERF:" server.log | grep "chain_break=1"
 Prefill stays flat (~13-18s) despite prompt growing to 47K tokens.
 `chain_break=0` on every request — prompt byte-stable.
 
+![SSD Cache Benchmark Results](benchmark_fix_abc.png)
+
 Full data: [SSD_CACHE_BENCHMARK_FIX_ABC.md](SSD_CACHE_BENCHMARK_FIX_ABC.md) · [SSD_CACHE_BENCHMARK_RESULTS.md](SSD_CACHE_BENCHMARK_RESULTS.md)
 
 ---
