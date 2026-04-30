@@ -151,6 +151,41 @@ def _tokens_matching_literal_prefix(
 
 def _tokens_for_non_newline_content(token_texts: Dict[int, str]) -> Set[int]:
     """
+    Find token IDs allowed while inside a field's content line.
+
+    A token is allowed if it contains at least one non-newline character, OR
+    if it is a bare newline (which signals end-of-field to the state machine).
+
+    Bare newlines must be allowed because the model transitions from IN_LINE
+    to the next WAITING_PREFIX via _advance_by_token checking endswith('\\n').
+    Blocking bare \\n caused infinite loops: the model couldn't emit the
+    transition token and repeated content tokens until max_tokens.
+    """
+    allowed = set()
+    for tid, text in token_texts.items():
+        if not text:
+            continue
+        text_bytes = text.encode('utf-8')
+        # Check for newlines NOT at the very end of the token.
+        # A token ending in newline is also allowed (it transitions state),
+        # but only if there's at least one non-newline char before it.
+        has_mid_newline = any(
+            b == 0x0A for b in text_bytes[:-1]
+        ) if len(text_bytes) > 1 else False
+        # Allow bare newline tokens (they trigger field transitions in the
+        # state machine's _advance_by_token via endswith('\\n')).
+        # Previously blocked because [^\\n]+ was interpreted literally at the
+        # mask level, but the state machine handles content-length correctly.
+        if text.strip('\\n') == '':
+            allowed.add(tid)
+            continue
+        if not has_mid_newline:
+            allowed.add(tid)
+    return allowed
+
+
+def _tokens_for_non_newline_content(token_texts: Dict[int, str]) -> Set[int]:
+    """
     Find token IDs whose decoded text contains at least one non-newline
     character (to satisfy [^\\n]+) — or whose decoded text ends with a
     newline (which transitions to the next grammar state).
