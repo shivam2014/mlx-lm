@@ -10,6 +10,7 @@ from .qwen3_5 import Model as Qwen3_5Model
 class ModelArgs(BaseModelArgs):
     model_type: str
     text_config: dict
+    mtp_num_hidden_layers: int = 0
 
     @classmethod
     def from_dict(cls, params):

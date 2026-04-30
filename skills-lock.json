@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "writing-x-posts": {
+      "source": "smithery.ai",
+      "sourceType": "well-known",
+      "computedHash": "855d65d62dae71a4c9842d43df3e448d04129385db9bba3d89e27ca3505629a7"
+    }
+  }
+}

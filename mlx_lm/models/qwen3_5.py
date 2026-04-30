@@ -427,8 +427,8 @@ class TextModel(nn.Module):
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
-    mtp_num_hidden_layers: int = 0
     text_config: dict
+    mtp_num_hidden_layers: int = 0
 
     @classmethod
     def from_dict(cls, params):
