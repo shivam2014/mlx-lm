@@ -267,6 +267,8 @@ def make_structured_think_processor(
         "forced_prefix_remaining": [],  # token IDs yet to be force-emitted for current prefix
         "pending_flush": False,  # True when detokenizer should finalize() after prefix
         "_pending_newline": False,  # True after a lone \n token; \n\n triggers field transition
+        "_tokens_in_field": 0,  # tokens generated since last field start
+        "_max_field_tokens": 300,  # force field transition after this many tokens
     }
 
     # Pre-compute masks for all (grammar_state, field_index, chars_consumed) combos
@@ -385,6 +387,24 @@ def make_structured_think_processor(
             # The _pending_newline flag tracks whether we just saw a lone
             # \\n token, so a second consecutive \n forms \\n\\n.
             _last_pending = state.get("_pending_newline", False)
+            # Increment field token counter and enforce max field length
+            state["_tokens_in_field"] = state.get("_tokens_in_field", 0) + 1
+            if state["_tokens_in_field"] >= state.get("_max_field_tokens", 300):
+                # Force field transition due to token limit exceeded
+                fi += 1
+                state["field_index"] = fi
+                state["chars_consumed"] = 0
+                if fi >= len(fields):
+                    state["grammar_state"] = ThinkState.WAITING_THINK_END
+                else:
+                    state["grammar_state"] = ThinkState.WAITING_PREFIX
+                    state["_tokens_in_field"] = 0
+                    if field_prefix_token_seqs and fi < len(field_prefix_token_seqs):
+                        state["forced_prefix_remaining"] = list(field_prefix_token_seqs[fi])
+                    else:
+                        state["forced_prefix_remaining"] = []
+                return
+
 
             # Check if this token CONTAINS \\n\\n (single token like 271 or 4558)
             if '\n\n' in text:
@@ -397,6 +417,7 @@ def make_structured_think_processor(
                     state["grammar_state"] = ThinkState.WAITING_THINK_END
                 else:
                     state["grammar_state"] = ThinkState.WAITING_PREFIX
+                    state["_tokens_in_field"] = 0
                     if field_prefix_token_seqs and fi < len(field_prefix_token_seqs):
                         state["forced_prefix_remaining"] = list(field_prefix_token_seqs[fi])
                     else:
@@ -415,6 +436,7 @@ def make_structured_think_processor(
                         state["grammar_state"] = ThinkState.WAITING_THINK_END
                     else:
                         state["grammar_state"] = ThinkState.WAITING_PREFIX
+                        state["_tokens_in_field"] = 0
                         if field_prefix_token_seqs and fi < len(field_prefix_token_seqs):
                             state["forced_prefix_remaining"] = list(field_prefix_token_seqs[fi])
                         else:
@@ -477,6 +499,7 @@ def make_structured_think_processor(
                             state["grammar_state"] = ThinkState.WAITING_THINK_END
                         else:
                             state["grammar_state"] = ThinkState.WAITING_PREFIX
+                            state["_tokens_in_field"] = 0
                     else:
                         # Overflow is valid line content, stay in IN_LINE
                         pass
@@ -528,6 +551,7 @@ def make_structured_think_processor(
         if state["inside_think"] and not was_inside:
             # Just entered think — reset grammar to start
             state["grammar_state"] = ThinkState.WAITING_PREFIX
+            state["_tokens_in_field"] = 0
             state["chars_consumed"] = 0
             state["field_index"] = 0
             # Queue the first field's prefix tokens for forced emission
