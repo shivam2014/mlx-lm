@@ -254,6 +254,9 @@ class QuantizedKVCache(_BaseCache):
         self.keys = None
         self.values = None
         self.offset = 0
+        self._rollback_keys = None
+        self._rollback_values = None
+        self._rollback_offset = None
         # Support KVSplit: bits/group_size may be (key, value) tuples
         if isinstance(bits, (tuple, list)):
             self.key_bits, self.value_bits = bits
@@ -402,6 +405,40 @@ class QuantizedKVCache(_BaseCache):
     @property
     def nbytes(self):
         return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
+
+    def arm_rollback(self, prefix_len: int = 0) -> None:
+        """Save a snapshot of the current quantized state for speculative decoding rollback.
+
+        Called before the target model verifies draft tokens. Stores a reference
+        to the current keys/values and offset so that rollback() can restore to
+        the prefix position if some draft tokens are rejected.
+        """
+        del prefix_len  # snapshot the full current state; rollback uses n_accepted
+        self._rollback_keys = self.keys
+        self._rollback_values = self.values
+        self._rollback_offset = self.offset
+
+    def rollback(self, n_accepted: int) -> None:
+        """Restore the cache to prefix_len + n_accepted tokens after verification.
+
+        Called when not all drafted tokens were accepted. Resets the offset to
+        (pre-verification prefix) + n_accepted. Stale quantized data beyond the
+        new offset will be overwritten on the next forward pass.
+        """
+        if self._rollback_offset is None:
+            self.clear_transients()
+            return
+        self.offset = self._rollback_offset + int(n_accepted)
+        self.keys = self._rollback_keys
+        self.values = self._rollback_values
+        self.clear_transients()
+
+    def clear_transients(self) -> None:
+        """Clear saved rollback snapshot to free memory."""
+        self._rollback_keys = None
+        self._rollback_values = None
+        self._rollback_offset = None
+
 
 
 class KVCache(_BaseCache):
@@ -969,6 +1006,8 @@ class QuantizedRotatingKVCache(RotatingKVCache):
         if self.keys is None:
             return 0
         return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
+
+
 
     def to_quantized(
         self, group_size: int = 64, bits: int = 4
