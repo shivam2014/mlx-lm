@@ -1959,7 +1959,8 @@ def run(
         response_generator.join()
 
 
-def main():
+def build_server_parser() -> argparse.ArgumentParser:
+    """Build the MLX LM server argument parser."""
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
         "--model",
@@ -2151,6 +2152,11 @@ def main():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    return parser
+
+
+def main():
+    parser = build_server_parser()
     args = parser.parse_args()
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
