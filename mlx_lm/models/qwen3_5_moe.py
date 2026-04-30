@@ -15,6 +15,11 @@ class ModelArgs(BaseModelArgs):
     def from_dict(cls, params):
         if "text_config" not in params:
             return cls(model_type=params["model_type"], text_config=params)
+        # Extract mtp_num_hidden_layers from text_config (Qwen 3.6 stores it there)
+        if "mtp_num_hidden_layers" not in params:
+            tc = params.get("text_config", {})
+            if isinstance(tc, dict) and "mtp_num_hidden_layers" in tc:
+                params = {**params, "mtp_num_hidden_layers": tc["mtp_num_hidden_layers"]}
         return super().from_dict(params)
 
 
@@ -49,4 +54,17 @@ class Model(Qwen3_5Model):
                     f"{prefix}.experts.down_proj"
                 )
 
+
+        # Extract and route MTP weights if MTP module is present
+        if hasattr(self, "mtp") and hasattr(getattr(self, "language_model", None), "mtp"):
+            mtp_weights = {}
+            for k, v in list(new_weights.items()):
+                if k.startswith("language_model.model.mtp.") or k.startswith("language_model.mtp."):
+                    mtp_key = k.replace("language_model.model.mtp.", "mtp.")
+                    mtp_key = mtp_key.replace("language_model.mtp.", "mtp.")
+                    mtp_weights[mtp_key] = v
+                    del new_weights[k]
+            if mtp_weights:
+                mtp_weights = self.language_model.sanitize(mtp_weights)
+                new_weights.update(mtp_weights)
         return self.language_model.sanitize(new_weights)
