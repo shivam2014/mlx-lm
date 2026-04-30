@@ -377,9 +377,8 @@ class TextModel(nn.Module):
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
         should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
-        # Keep MTP weights if the model has an MTP module
-        if not hasattr(self, "mtp"):
-            weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        # Strip MTP weights from backbone — they're loaded separately
+        weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -455,7 +454,7 @@ class Model(nn.Module):
             t_args = TextModelArgs.from_dict(args.text_config)
             t_args.mtp_num_hidden_layers = mtp_layers
             self.mtp = MTPModule(t_args)
-            self.language_model.mtp = self.mtp
+            # self.language_model.mtp = self.mtp  # removed: creates duplicate weight paths
 
     def __call__(
         self,

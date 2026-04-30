@@ -412,7 +412,11 @@ def load_model(
         model.update_modules(leaves)
 
     model.eval()
-    model.load_weights(list(weights.items()), strict=strict)
+    # If model has optional MTP module, load non-strictly
+    _load_strict = strict
+    if hasattr(model, "mtp") and _load_strict:
+        _load_strict = False
+    model.load_weights(list(weights.items()), strict=_load_strict)
 
     if not lazy:
         mx.eval(model.parameters())

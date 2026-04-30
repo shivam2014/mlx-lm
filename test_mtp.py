@@ -1,108 +1,144 @@
 """
-MTP Acceptance Rate Test
+MTP Acceptance Rate Test — Qwen 3.6 models with built-in MTP heads.
 
-Measures how often the built-in MTP head predicts the same next token 
-as the backbone on Qwen 3.6 models.
+Measures how often the MTP head predicts the same next token as the backbone,
+without needing a separate draft model.
 
 Usage:
-    python test_mtp.py --model Qwen/Qwen3.6-35B-A3B
-    python test_mtp.py --model mlx-community/Qwen3.6-27B-4bit
+    python test_mtp.py --model Qwen3.6-27B-UD-MLX-4bit
+    python test_mtp.py --model Qwen3.6-35B-A3B-ConfigI-MLX --mtp-shards 25,26
 """
 import argparse
 import time
 import mlx.core as mx
-from mlx_lm import load, generate
+from mlx_lm import load
 from mlx_lm.models.cache import make_prompt_cache
+
+
+def _inject_mtp_weights(model, weights):
+    """Set MTP weights via direct attribute assignment (load_weights key format doesn't match)."""
+    key_map = {
+        "fc.weight": ("fc", "weight"),
+        "norm.weight": ("norm", "weight"),
+        "pre_fc_norm_hidden.weight": ("pre_fc_norm_hidden", "weight"),
+        "pre_fc_norm_embedding.weight": ("pre_fc_norm_embedding", "weight"),
+        "layers.0.input_layernorm.weight": ("layers.0.input_layernorm", "weight"),
+        "layers.0.post_attention_layernorm.weight": ("layers.0.post_attention_layernorm", "weight"),
+        "layers.0.self_attn.q_proj.weight": ("layers.0.self_attn.q_proj", "weight"),
+        "layers.0.self_attn.k_proj.weight": ("layers.0.self_attn.k_proj", "weight"),
+        "layers.0.self_attn.v_proj.weight": ("layers.0.self_attn.v_proj", "weight"),
+        "layers.0.self_attn.o_proj.weight": ("layers.0.self_attn.o_proj", "weight"),
+        "layers.0.self_attn.q_norm.weight": ("layers.0.self_attn.q_norm", "weight"),
+        "layers.0.self_attn.k_norm.weight": ("layers.0.self_attn.k_norm", "weight"),
+        "layers.0.mlp.gate_proj.weight": ("layers.0.mlp.gate_proj", "weight"),
+        "layers.0.mlp.down_proj.weight": ("layers.0.mlp.down_proj", "weight"),
+        "layers.0.mlp.up_proj.weight": ("layers.0.mlp.up_proj", "weight"),
+    }
+    for hf_key, (param_path, attr) in key_map.items():
+        if hf_key not in weights:
+            continue
+        v = weights[hf_key]
+        parts = param_path.split(".")
+        obj = model.mtp
+        for p in parts:
+            obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
+        setattr(obj, attr, v)
+    return len([k for k in key_map if k in weights])
 
 
 def main():
     parser = argparse.ArgumentParser(description="Test MTP acceptance rate")
     parser.add_argument("--model", type=str, required=True, help="Model path")
-    parser.add_argument("--prompt", type=str,
-                        default="Write a haiku about speculative decoding:")
-    parser.add_argument("--num-tokens", type=int, default=128,
-                        help="Number of tokens to test")
-    parser.add_argument("--mtp-layers", type=int, default=1,
-                        help="Number of MTP layers (from model config)")
+    parser.add_argument("--mtp-weights", type=str, default=None,
+                        help="Path to pre-extracted MTP weights safetensors")
+    parser.add_argument("--raw-hf-dir", type=str, default=None,
+                        help="Path to raw HuggingFace checkpoint for MTP weight extraction")
+    parser.add_argument("--prompt", type=str, default="Write a haiku about speculative decoding:")
+    parser.add_argument("--num-tokens", type=int, default=128)
     args = parser.parse_args()
 
-    # Load model
-    print(f"Loading {args.model}...")
+    print(f"Loading model...")
     t0 = time.time()
-    model, tokenizer = load(
-        args.model,
-        model_config={"mtp_num_hidden_layers": args.mtp_layers},
-    )
+    model, tokenizer = load(args.model)
     print(f"Loaded in {time.time() - t0:.1f}s")
 
-    # Check if MTP module was created
-    if hasattr(model, "mtp"):
-        print(f"✅ MTP module active ({args.mtp_layers} layer(s))")
-    else:
-        print("⚠️ MTP module not created — model may not have MTP heads.")
+    if not hasattr(model, "mtp"):
+        print("❌ Model doesn't have MTP module")
         return
 
-    # Tokenize
-    prompt_tokens = mx.array([tokenizer.encode(args.prompt)])
-    prompt_len = prompt_tokens.shape[1]
-    print(f"Prompt: {prompt_len} tokens, testing {args.num_tokens} tokens\n")
+    # Load/inject MTP weights
+    mtp_weights = None
+    if args.mtp_weights:
+        mtp_weights = mx.load(args.mtp_weights)
+    elif args.raw_hf_dir:
+        import json
+        idx = json.load(open(f"{args.raw_hf_dir}/model.safetensors.index.json"))
+        mtp_shards = set()
+        for k, v in idx["weight_map"].items():
+            if "mtp." in k.lower():
+                mtp_shards.add(v)
+        mtp_weights = {}
+        for shard in sorted(mtp_shards):
+            w = mx.load(f"{args.raw_hf_dir}/{shard}")
+            for k, v in w.items():
+                if "mtp." in k.lower():
+                    new_k = k[4:]  # Strip "mtp." prefix
+                    mtp_weights[new_k] = v
+        # Apply norm shifts (all except norm.weight which is not delta format)
+        norm_suffixes = (
+            ".input_layernorm.weight", ".post_attention_layernorm.weight",
+            ".q_norm.weight", ".k_norm.weight",
+            ".pre_fc_norm_hidden.weight", ".pre_fc_norm_embedding.weight",
+        )
+        for k in list(mtp_weights.keys()):
+            if any(k.endswith(s) for s in norm_suffixes) and mtp_weights[k].ndim == 1:
+                mtp_weights[k] = (mtp_weights[k].astype(mx.float32) + 1.0).astype(mx.bfloat16)
 
-    # Prefill — create persistent caches for backbone
-    backbone_cache = make_prompt_cache(model)
-    
-    # Full prefill
-    logits, h = model(prompt_tokens, cache=backbone_cache, return_hidden=True)
+    if mtp_weights is None:
+        print("⚠️ No MTP weights provided. Use --mtp-weights or --raw-hf-dir")
+        return
+
+    n = _inject_mtp_weights(model, mtp_weights)
+    print(f"Injected {n} MTP weights")
+
+    # Run test
+    tokens = mx.array([tokenizer.encode(args.prompt)])
+    cache = make_prompt_cache(model)
+    logits, h = model(tokens, cache=cache, return_hidden=True)
     mx.eval(logits, h)
-    
-    # First token
     backbone_token = mx.argmax(logits[:, -1, :], axis=-1)
     generated = [int(backbone_token.item())]
     last_hidden = h[:, -1:, :]
-    
-    # Initialize MTP cache
     mtp_cache = model.make_mtp_cache()
-
     mtp_correct = 0
-    mtp_total = 0
 
     for step in range(args.num_tokens):
-        # --- MTP prediction (draft) ---
-        last_token_arr = mx.array([[generated[-1]]], dtype=mx.uint32)
-        mtp_logits = model.mtp_forward(last_hidden, last_token_arr, cache=mtp_cache)
+        last_arr = mx.array([[generated[-1]]], dtype=mx.uint32)
+        mtp_logits = model.mtp_forward(last_hidden, last_arr, cache=mtp_cache)
         mx.eval(mtp_logits)
         mtp_next = mx.argmax(mtp_logits[:, -1, :], axis=-1)
 
-        # --- Backbone forward (verify + get next hidden) ---
-        logits, h = model(last_token_arr, cache=backbone_cache, return_hidden=True)
+        logits, h = model(last_arr, cache=cache, return_hidden=True)
         mx.eval(logits, h)
-        backbone_next = mx.argmax(logits[:, -1, :], axis=-1)
+        bb_next = mx.argmax(logits[:, -1, :], axis=-1)
 
-        # --- Compare ---
-        mtp_total += 1
-        if int(mtp_next.item()) == int(backbone_next.item()):
-            mtp_correct += 1
-
-        generated.append(int(backbone_next.item()))
+        mtp_correct += int(mtp_next.item()) == int(bb_next.item())
+        generated.append(int(bb_next.item()))
         last_hidden = h[:, -1:, :]
 
-        if (step + 1) % 32 == 0 or step == 0:
-            acc = (mtp_correct / mtp_total) * 100
-            print(f"  Step {step+1:>4}/{args.num_tokens}  "
-                  f"acceptance: {acc:>5.1f}%  ({mtp_correct}/{mtp_total})")
+        if (step + 1) % 32 == 0:
+            print(f"  Step {step+1:>4}  acceptance: {mtp_correct/(step+1)*100:.1f}%")
 
-    final_acc = (mtp_correct / mtp_total) * 100
+    final = mtp_correct / args.num_tokens * 100
     print(f"\n{'='*50}")
-    print(f"MTP ACCEPTANCE RATE: {final_acc:.1f}% ({mtp_correct}/{mtp_total})")
-    print(f"Generated: {tokenizer.decode(generated)[:200]}...")
-
-    if final_acc > 70:
+    print(f"MTP ACCEPTANCE RATE: {final:.1f}% ({mtp_correct}/{args.num_tokens})")
+    print(f"Generated preview: {tokenizer.decode(generated)[:200]}")
+    if final > 70:
         print(f"\n✅ ≥70% — MTP speculative decoding would give ~2-4x speedup!")
-    elif final_acc > 50:
-        print(f"\n👍 50-70% — would give ~1.5-2x speedup.")
-    elif final_acc > 30:
-        print(f"\n⚠️ 30-50% — marginal gains, likely won't beat baseline.")
+    elif final > 50:
+        print(f"\n👍 50-70% — ~1.5-2x speedup.")
     else:
-        print(f"\n❌ Below 30% — MTP heads may need investigation.")
+        print(f"\n⚠️ Below 50% — marginal.")
 
 
 if __name__ == "__main__":
