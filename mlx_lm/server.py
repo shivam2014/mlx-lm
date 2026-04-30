@@ -39,6 +39,7 @@ from .generate import (
     SequenceStateMachine,
     stream_generate,
 )
+from .structured_think import GrammarConfig, make_structured_think_processor
 from .hermes_prefix_cache import HermesPrefixOptimizer
 from .models.cache import (
     LRUPromptCache,
@@ -196,6 +197,7 @@ class GenerationArguments:
     top_logprobs: int
     seed: Optional[int]
     chat_template_kwargs: Optional[Dict[str, Any]]
+    think_fields: Optional[str] = None
 
 
 @dataclass
@@ -326,6 +328,13 @@ class ModelProvider:
         }
         if cli_args.chat_template:
             self._tokenizer_config["chat_template"] = cli_args.chat_template
+        # Inject preserve_thinking/enable_thinking from --chat-template-args
+        # into tokenizer_config so the tokenizer handles thinking tokens correctly.
+        if hasattr(cli_args, 'chat_template_args') and cli_args.chat_template_args:
+            for key in ("preserve_thinking", "enable_thinking"):
+                if key in cli_args.chat_template_args:
+                    self._tokenizer_config[key] = cli_args.chat_template_args[key]
+
 
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
         if self.is_distributed and (
@@ -703,6 +712,8 @@ class ResponseGenerator:
     def _is_batchable(self, args):
         if getattr(self.cli_args, "kv_bits", None) is not None:
             return False
+        if getattr(args, "think_fields", None) is not None:
+            return False
         return self.model_provider.is_batchable and args.seed is None
 
     def _generate(self):
@@ -990,6 +1001,32 @@ class ResponseGenerator:
             sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
 
+            # Add structured think processor if --think-fields is set
+            if hasattr(args, 'think_fields') and args.think_fields:
+                fields = [f.strip().upper() for f in args.think_fields.split(",")]
+                config = GrammarConfig(fields=tuple(fields))
+                processor = make_structured_think_processor(tokenizer, config)
+                # Wrap processor to include the full prompt prefix, since generate_step
+                # only passes tokens accumulated from the first _step() call onward.
+                _prompt_ids = prompt if isinstance(prompt, list) else list(prompt)
+                _inner = processor
+                _full_prompt_len = len(_prompt_ids)
+                def processor(tokens, logits):
+                    if hasattr(tokens, 'tolist'):
+                        tl = tokens.tolist()
+                    else:
+                        tl = list(tokens)
+                    # Prepend prompt if not already included
+                    if len(tl) < _full_prompt_len:
+                        combined = _prompt_ids + tl
+                        if hasattr(tokens, 'tolist'):
+                            combined_arr = mx.array(combined)
+                        else:
+                            combined_arr = type(tokens)(combined)
+                        return _inner(combined_arr, logits)
+                    return _inner(tokens, logits)
+                logits_processors.append(processor)
+
             # Load the KV cache
             self._log_cache_stats()
             cache, rest = self.prompt_cache.fetch_nearest_cache(
@@ -1276,6 +1313,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
+        self.think_fields = self.body.get("think_fields", self.response_generator.cli_args.think_fields)
         self.validate_model_parameters()
 
         # Get stop sequences
@@ -1489,6 +1527,7 @@ class APIHandler(BaseHTTPRequestHandler):
             top_logprobs=self.top_logprobs,
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
+            think_fields=self.think_fields,
         )
 
         # Keep connection alive during long prompt processing and show
@@ -1868,6 +1907,7 @@ def run(
     ssd_cache = None
     ssd_cache_dir = getattr(cli_args, "ssd_cache_dir", None)
     ssd_cache_max_size = getattr(cli_args, "ssd_cache_max_size", 0)
+
     if ssd_cache_dir is not None:
         logging.warning(
             "--ssd-cache-dir is deprecated, use --block-ssd-cache-dir instead"
@@ -1935,7 +1975,8 @@ def run(
         response_generator.join()
 
 
-def main():
+def build_server_parser() -> argparse.ArgumentParser:
+    """Build the MLX LM server argument parser."""
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
         "--model",
@@ -2098,6 +2139,15 @@ def main():
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(
+        "--think-fields",
+        type=str,
+        default=None,
+        help="Comma-separated field names to constrain the think block. "
+             "When set, the model's thinking is forced into FIELD: content\\n "
+             "format, e.g., 'GOAL,APPROACH,EDGE'."
+    )
+
+    parser.add_argument(
         "--ssd-cache-dir",
         type=str,
         default=None,
@@ -2127,6 +2177,11 @@ def main():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    return parser
+
+
+def main():
+    parser = build_server_parser()
     args = parser.parse_args()
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]

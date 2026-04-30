@@ -41,6 +41,7 @@ from .models.cache import (
     load_prompt_cache,
 )
 from .sample_utils import make_sampler
+from .structured_think import GrammarConfig, make_structured_think_processor
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -233,6 +234,18 @@ def setup_arg_parser():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--think-fields",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated field names to constrain the think block. "
+            "Example: 'GOAL,APPROACH,EDGE'. "
+            "When set, the model's thinking is forced into FIELD: content\\n "
+            "format until all fields are completed, then `` is emitted. "
+            "Based on https://andthattoo.dev/blog/structured_cot"
+        ),
     )
     return parser
 
@@ -747,6 +760,10 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
+    # Extract logits processors so we can check their state during streaming
+    # (e.g., for pending_flush after forced prefix emission)
+    _stream_logits_processors = kwargs.get("logits_processors", None)
+
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
@@ -771,6 +788,16 @@ def stream_generate(
                 break
 
             detokenizer.add_token(token)
+
+            # Flush detokenizer after forced prefix emission to fix the
+            # display bug where single-byte prefix tokens (G, O) are buffered
+            # and the user sees "AL:" instead of "GOAL:".
+            if _stream_logits_processors:
+                for proc in _stream_logits_processors:
+                    if hasattr(proc, 'pending_flush') and proc.pending_flush:
+                        detokenizer.finalize()
+                        break
+
             if (n + 1) == max_tokens:
                 break
 
@@ -2042,6 +2069,15 @@ def main():
     )
     tokenizer_config["trust_remote_code"] = True if args.trust_remote_code else None
 
+    # Parse --chat-template-config early to inject thinking config
+    # into tokenizer_config before loading the tokenizer.
+    template_kwargs = {}
+    if args.chat_template_config is not None:
+        template_kwargs = json.loads(args.chat_template_config)
+        for key in ("preserve_thinking", "enable_thinking"):
+            if key in template_kwargs:
+                tokenizer_config[key] = template_kwargs[key]
+
     model_path = args.model
     if using_cache:
         if model_path is None:
@@ -2062,10 +2098,6 @@ def main():
     )
     for eos_token in args.extra_eos_token:
         tokenizer.add_eos_token(eos_token)
-
-    template_kwargs = {}
-    if args.chat_template_config is not None:
-        template_kwargs = json.loads(args.chat_template_config)
 
     prompt = args.prompt.replace("\\n", "\n").replace("\\t", "\t")
     prompt = sys.stdin.read() if prompt == "-" else prompt
@@ -2118,6 +2150,31 @@ def main():
         xtc_threshold=args.xtc_threshold,
         xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
     )
+    logits_processors = []
+    if args.think_fields:
+        fields = [f.strip().upper() for f in args.think_fields.split(",")]
+        config = GrammarConfig(fields=tuple(fields))
+        processor = make_structured_think_processor(tokenizer, config)
+        # Wrap processor to include the full prompt prefix, since generate_step
+        # only passes tokens accumulated from the first _step() call onward.
+        _prompt_ids = prompt if isinstance(prompt, list) else list(prompt)
+        _inner = processor
+        def processor(tokens, logits):
+            if hasattr(tokens, 'tolist'):
+                tl = tokens.tolist()
+            else:
+                tl = list(tokens)
+            # Prepend prompt if not already included
+            if len(tl) < len(_prompt_ids):
+                combined = _prompt_ids + tl
+                if hasattr(tokens, 'tolist'):
+                    import mlx.core as mx
+                    combined_arr = mx.array(combined)
+                else:
+                    combined_arr = type(tokens)(combined)
+                return _inner(combined_arr, logits)
+            return _inner(tokens, logits)
+        logits_processors.append(processor)
     response = generate(
         model,
         tokenizer,
@@ -2134,6 +2191,7 @@ def main():
         kv_boundary_bits=args.kv_boundary_bits,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        logits_processors=logits_processors,
     )
     if not args.verbose:
         print(response)
