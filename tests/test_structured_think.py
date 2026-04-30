@@ -201,18 +201,22 @@ class TestStateMachine3Fields(unittest.TestCase):
     def test_goal_line_completed(self):
         self._step(1, 10, 20)  # <think>, "GOAL: ", "hello\n"
         self.assertTrue(self.state["inside_think"])
-        self.assertEqual(self.state["grammar_state"], ThinkState.WAITING_PREFIX)
-        self.assertEqual(self.state["field_index"], 1)  # Moved to APPROACH
+        # Single \n is content — stays in IN_LINE, doesn't transition
+        self.assertEqual(self.state["grammar_state"], ThinkState.IN_LINE)
+        self.assertEqual(self.state["field_index"], 0)  # Still on first field
 
     def test_full_3_field_sequence(self):
         self._step(
             1,   # <think>
             10,  # GOAL:
             20,  # hello\n
+            31,  # \\n\\n — field delimiter
             11,  # APPROACH:
             22,  # world\n
+            31,  # \\n\\n — field delimiter
             12,  # EDGE:
             20,  # hello\n
+            31,  # \\n\\n — field delimiter
         )
         self.assertEqual(self.state["grammar_state"], ThinkState.WAITING_THINK_END)
         self.assertEqual(self.state["field_index"], 3)  # All fields done
@@ -275,7 +279,7 @@ class TestStateMachine2Fields(unittest.TestCase):
         mx.eval(logits)
 
     def test_2_field_sequence_to_think_end(self):
-        self._step(1, 10, 20, 11, 20)
+        self._step(1, 10, 20, 31, 11, 20, 31)
         self.assertEqual(self.state["grammar_state"], ThinkState.WAITING_THINK_END)
         self.assertEqual(self.state["field_index"], 2)
 
@@ -314,14 +318,19 @@ class TestStateMachine5Fields(unittest.TestCase):
             1,   # <think>
             10,  # GOAL:
             20,  # line
+            31,  # \n\n — field delimiter
             11,  # STATE:
             20,  # line
+            31,  # \n\n — field delimiter
             12,  # ALGO:
             20,  # line
+            31,  # \n\n — field delimiter
             13,  # EDGE:
             20,  # line
+            31,  # \n\n — field delimiter
             14,  # VERIFY:
             20,  # line
+            31,  # \n\n — field delimiter
         )
         self.assertEqual(self.state["grammar_state"], ThinkState.WAITING_THINK_END)
         self.assertEqual(self.state["field_index"], 5)
@@ -356,7 +365,7 @@ class TestMaskApplication(unittest.TestCase):
             0: "", 1: "<think>", 2: "</think>",
             10: "GOAL: ", 11: "APPROACH: ", 12: "EDGE: ",
             20: "hello\n", 21: "hello",
-            30: "</think>\n\n",
+            30: "</think>\n\n", 31: "\n\n",
             99: "xyz",
         }
         self.t = _mock_tokenizer(self.vocab)
@@ -389,7 +398,7 @@ class TestMaskApplication(unittest.TestCase):
         """After exiting think, all logits are unconstrained again."""
         # Enter and exit think
         self._get_result_logits(
-            1, 10, 20, 11, 20, 12, 20, 30  # Full 3-field + exit
+            1, 10, 20, 31, 11, 20, 31, 12, 20, 31, 30  # Full 3-field + exit
         )
         # Now outside think
         result = self._get_result_logits(99)  # Just "xyz"

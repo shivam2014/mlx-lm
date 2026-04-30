@@ -266,6 +266,7 @@ def make_structured_think_processor(
         "last_token_count": 0,  # for dedup
         "forced_prefix_remaining": [],  # token IDs yet to be force-emitted for current prefix
         "pending_flush": False,  # True when detokenizer should finalize() after prefix
+        "_pending_newline": False,  # True after a lone \n token; \n\n triggers field transition
     }
 
     # Pre-compute masks for all (grammar_state, field_index, chars_consumed) combos
@@ -374,23 +375,63 @@ def make_structured_think_processor(
             return  # no advancement needed in code state
 
         if gs == ThinkState.IN_LINE:
-            # In line-content: check if token ends with newline
-            if text.endswith('\n'):
-                # Transition to next state
+            # In line-content: check for field delimiter (\\n\\n).
+            #
+            # Single \n is content (e.g., code line breaks, list items).
+            # Double \n signals end-of-field. This avoids premature field
+            # transitions when the model writes multi-line content (code,
+            # bullet lists, etc.) within a single field.
+            #
+            # The _pending_newline flag tracks whether we just saw a lone
+            # \\n token, so a second consecutive \n forms \\n\\n.
+            _last_pending = state.get("_pending_newline", False)
+
+            # Check if this token CONTAINS \\n\\n (single token like 271 or 4558)
+            if '\n\n' in text:
+                # Immediate transition
+                state["_pending_newline"] = False
                 fi += 1
                 state["field_index"] = fi
                 state["chars_consumed"] = 0
                 if fi >= len(fields):
-                    # All fields done — expect think end
                     state["grammar_state"] = ThinkState.WAITING_THINK_END
                 else:
                     state["grammar_state"] = ThinkState.WAITING_PREFIX
-                    # Queue the next field's prefix tokens for forced emission
                     if field_prefix_token_seqs and fi < len(field_prefix_token_seqs):
                         state["forced_prefix_remaining"] = list(field_prefix_token_seqs[fi])
                     else:
                         state["forced_prefix_remaining"] = []
-            # If no newline, stay in IN_LINE (loop)
+                return
+
+            # Check if this is a bare \n token (= token entirely \\n)
+            if text == '\n':
+                if _last_pending:
+                    # Two consecutive \\n tokens = \\n\\n → field transition
+                    state["_pending_newline"] = False
+                    fi += 1
+                    state["field_index"] = fi
+                    state["chars_consumed"] = 0
+                    if fi >= len(fields):
+                        state["grammar_state"] = ThinkState.WAITING_THINK_END
+                    else:
+                        state["grammar_state"] = ThinkState.WAITING_PREFIX
+                        if field_prefix_token_seqs and fi < len(field_prefix_token_seqs):
+                            state["forced_prefix_remaining"] = list(field_prefix_token_seqs[fi])
+                        else:
+                            state["forced_prefix_remaining"] = []
+                    return
+                else:
+                    # First bare \n — might be start of \\n\\n, stay in IN_LINE
+                    state["_pending_newline"] = True
+                    return
+
+            # Token ends with \\n (e.g., "  \\n" indent tokens):
+            # set pending flag so next \\n forms the delimiter
+            if text.endswith('\n'):
+                state["_pending_newline"] = True
+            else:
+                # Non-newline content resets the pending flag
+                state["_pending_newline"] = False
             return
 
         if gs == ThinkState.WAITING_PREFIX:
