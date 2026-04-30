@@ -41,6 +41,7 @@ class TextModelArgs(BaseModelArgs):
     attention_bias: bool = False
     head_dim: Optional[int] = None
     full_attention_interval: int = 4
+    mtp_num_hidden_layers: int = 1
 
     # MoE fields (optional, for Qwen3_5MoeForConditionalGeneration)
     num_experts: int = 0
@@ -240,6 +241,56 @@ class DecoderLayer(nn.Module):
         return out
 
 
+
+
+class MTPDecoderLayer(nn.Module):
+    def __init__(self, args: TextModelArgs):
+        super().__init__()
+        self.self_attn = Attention(args)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.mlp = MLP(args.hidden_size, args.intermediate_size)
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + r
+        out = h + self.mlp(self.post_attention_layernorm(h))
+        return out
+
+
+class MTPModule(nn.Module):
+    def __init__(self, args: TextModelArgs):
+        super().__init__()
+        self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.fc = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
+        self.layers = [MTPDecoderLayer(args) for _ in range(args.mtp_num_hidden_layers)]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        next_token_ids: mx.array,
+        embed_tokens: nn.Module,
+        cache: Optional[List[Any]] = None,
+    ) -> mx.array:
+        # Qwen 3.6 order: [embedding, hidden]
+        e = self.pre_fc_norm_embedding(embed_tokens(next_token_ids))
+        h = self.pre_fc_norm_hidden(hidden_states)
+        fused = self.fc(mx.concatenate([e, h], axis=-1))
+
+        for layer, c in zip(self.layers, cache or [None] * len(self.layers)):
+            fused = layer(fused, mask=None, cache=c)
+
+        return self.norm(fused)
+
 class Qwen3_5TextModel(nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
@@ -256,6 +307,7 @@ class Qwen3_5TextModel(nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
     ) -> mx.array:
         if input_embeddings is not None:
             hidden_states = input_embeddings
@@ -272,7 +324,10 @@ class Qwen3_5TextModel(nn.Module):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
 
-        return self.norm(hidden_states)
+        normed = self.norm(hidden_states)
+        if return_hidden:
+            return normed, hidden_states
+        return normed
 
 
 class TextModel(nn.Module):
@@ -289,13 +344,25 @@ class TextModel(nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
     ) -> mx.array:
-        out = self.model(inputs, cache, input_embeddings=input_embeddings)
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
+        if return_hidden:
+            out, h = self.model(
+                inputs, cache, input_embeddings=input_embeddings,
+                return_hidden=True,
+            )
+            if self.args.tie_word_embeddings:
+                logits = self.model.embed_tokens.as_linear(out)
+            else:
+                logits = self.lm_head(out)
+            return logits, h
         else:
-            out = self.lm_head(out)
-        return out
+            out = self.model(inputs, cache, input_embeddings=input_embeddings)
+            if self.args.tie_word_embeddings:
+                out = self.model.embed_tokens.as_linear(out)
+            else:
+                out = self.lm_head(out)
+            return out
 
     @property
     def layers(self):
@@ -310,7 +377,9 @@ class TextModel(nn.Module):
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
         should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
-        weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        # Keep MTP weights if the model has an MTP module
+        if not hasattr(self, "mtp"):
+            weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -321,6 +390,9 @@ class TextModel(nn.Module):
             "model.norm.weight",
             ".q_norm.weight",
             ".k_norm.weight",
+            ".pre_fc_norm_hidden.weight",
+            ".pre_fc_norm_embedding.weight",
+            "mtp.norm.weight",
         )
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
@@ -355,12 +427,18 @@ class TextModel(nn.Module):
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
+    mtp_num_hidden_layers: int = 0
     text_config: dict
 
     @classmethod
     def from_dict(cls, params):
         if "text_config" not in params:
             return cls(model_type=params["model_type"], text_config=params)
+        # Extract mtp_num_hidden_layers from text_config (Qwen 3.6 stores it there)
+        if "mtp_num_hidden_layers" not in params:
+            tc = params.get("text_config", {})
+            if isinstance(tc, dict) and "mtp_num_hidden_layers" in tc:
+                params = {**params, "mtp_num_hidden_layers": tc["mtp_num_hidden_layers"]}
         return super().from_dict(params)
 
 
@@ -371,15 +449,43 @@ class Model(nn.Module):
         self.model_type = args.model_type
         self.language_model = TextModel(TextModelArgs.from_dict(args.text_config))
 
+        # Create MTP module if model has MTP heads
+        mtp_layers = getattr(args, "mtp_num_hidden_layers", 0)
+        if mtp_layers > 0:
+            t_args = TextModelArgs.from_dict(args.text_config)
+            t_args.mtp_num_hidden_layers = mtp_layers
+            self.mtp = MTPModule(t_args)
+            self.language_model.mtp = self.mtp
+
     def __call__(
         self,
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
     ):
         return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
+            inputs, cache=cache, input_embeddings=input_embeddings,
+            return_hidden=return_hidden,
         )
+
+
+    def mtp_forward(self, hidden_states, next_token_ids, cache=None):
+        """Run MTP head to predict next token logits from backbone hidden states."""
+        h = self.mtp(
+            hidden_states,
+            next_token_ids,
+            self.language_model.model.embed_tokens,
+            cache=cache,
+        )
+        if self.language_model.args.tie_word_embeddings:
+            return self.language_model.model.embed_tokens.as_linear(h)
+        else:
+            return self.language_model.lm_head(h)
+
+    def make_mtp_cache(self):
+        """Create KV caches for MTP decoder layers."""
+        return [KVCache() for _ in range(len(self.mtp.layers))]
 
     def sanitize(self, weights):
         sanitized = {}
@@ -395,6 +501,19 @@ class Model(nn.Module):
             else:
                 key = "language_model." + key
             sanitized[key] = value
+
+        # Pass mtp weights through if MTP module is present
+        if hasattr(self, "mtp") and hasattr(getattr(self, "language_model", None), "mtp"):
+            mtp_weights = {}
+            for k, v in list(sanitized.items()):
+                if k.startswith("language_model.model.mtp.") or k.startswith("language_model.mtp."):
+                    mtp_key = k.replace("language_model.model.mtp.", "mtp.")
+                    mtp_key = mtp_key.replace("language_model.mtp.", "mtp.")
+                    mtp_weights[mtp_key] = v
+                    del sanitized[k]
+            if mtp_weights:
+                mtp_weights = self.language_model.sanitize(mtp_weights)
+                sanitized.update(mtp_weights)
         return self.language_model.sanitize(sanitized)
 
     def shard(self, group=None):
@@ -529,3 +648,4 @@ class Model(nn.Module):
     @property
     def cast_predicate(self):
         return self.language_model.cast_predicate
+
