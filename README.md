@@ -43,8 +43,7 @@ python3 -m mlx_lm server \
   --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
   --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
   --block-ssd-cache-max-size 50 \
-  --log-level DEBUG \
-  --prompt-cache-size 10 2>&1 | tee /tmp/server_bench.log
+  --prompt-cache-size 10 
 ```
 ---
 
