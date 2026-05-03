@@ -27,6 +27,20 @@ mlx_lm.server \
   --block-ssd-cache-max-size 50 \
   --prompt-cache-size 10
 ```
+> **Thinking mode** — model shows its reasoning before answering:
+> ```bash
+> cd /Users/shivam94/mlx-lm-vanilla/mlx-lm
+> /Users/shivam94/mlx-lm-vanilla/venv/bin/python3 -m mlx_lm server \
+>   --model /Users/shivam94/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
+>   --host 127.0.0.1 --port 8000 \
+>   --chat-template-args '{"enable_thinking":true, "preserve_thinking": true}' \
+>   --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
+>   --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
+>   --block-ssd-cache-max-size 50 \
+>   --log-level DEBUG \
+>   --prompt-cache-size 10
+> ```
+
 
 ---
 
@@ -225,6 +239,37 @@ mlx_lm.server \
 | `--block-ssd-cache-dir` | — | Persist KV blocks to SSD | Survives server restarts. Without this, every restart recomputes the full system prompt from scratch. |
 | `--block-ssd-cache-max-size` | `50` | SSD cache limit in GB | A 29K-token system prompt uses ~40GB in blocks. 50GB gives headroom for a few sessions. |
 | `--prompt-cache-size` | `10` | Keep N most-recent KV caches in RAM | Higher values use more RAM but reduce SSD round-trips. 10 is enough for typical agent sessions. |
+
+
+### Thinking Mode
+
+For models that support reasoning (Qwen3.6‑35B‑A3B, Qwen3.5‑27B), add
+`--chat-template-args` with both flags:
+
+```bash
+--chat-template-args '{"enable_thinking":true, "preserve_thinking": true}'
+```
+
+| Flag | Effect |
+|------|--------|
+| `enable_thinking: true` | Instructs the model to produce a `<think>...</think>` block before answering |
+| `preserve_thinking: true` | Keeps the thinking block in the response stream (instead of stripping it) |
+
+The response will include a `reasoning` field alongside `content` in the
+chat completion payload. Full command:
+
+```bash
+cd /Users/shivam94/mlx-lm-vanilla/mlx-lm
+/Users/shivam94/mlx-lm-vanilla/venv/bin/python3 -m mlx_lm server \
+  --model /Users/shivam94/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
+  --host 127.0.0.1 --port 8000 \
+  --chat-template-args '{"enable_thinking":true, "preserve_thinking": true}' \
+  --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
+  --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
+  --block-ssd-cache-max-size 50 \
+  --log-level DEBUG \
+  --prompt-cache-size 10
+```
 
 ---
 
