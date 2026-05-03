@@ -271,6 +271,19 @@ cd /Users/shivam94/mlx-lm-vanilla/mlx-lm
   --prompt-cache-size 10
 ```
 
+> **Debug mode** — pipe server logs to a file for post-mortem analysis:
+> ```bash
+> cd /Users/shivam94/mlx-lm-vanilla/mlx-lm
+> /Users/shivam94/mlx-lm-vanilla/venv/bin/python3 -m mlx_lm server \
+>   --model /Users/shivam94/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
+>   --host 127.0.0.1 --port 8000 \
+>   --chat-template-args '{"enable_thinking":true, "preserve_thinking": true}' \
+>   --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
+>   --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
+>   --block-ssd-cache-max-size 50 \
+>   --log-level DEBUG \
+>   --prompt-cache-size 10 2>&1 | tee /tmp/server_bench.log
+> ```
 ---
 
 ## What's Next: DFlash
