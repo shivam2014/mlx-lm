@@ -259,19 +259,8 @@ For models that support reasoning (Qwen3.6‑35B‑A3B, Qwen3.5‑27B), add
 | `preserve_thinking: true` | Keeps the thinking block in the response stream (instead of stripping it) |
 
 The response will include a `reasoning` field alongside `content` in the
-chat completion payload. Full command:
+chat completion payload.
 
-```bash
-python3 -m mlx_lm server \
-  --model ~/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
-  --host 127.0.0.1 --port 8000 \
-  --chat-template-args '{"enable_thinking":true, "preserve_thinking": true}' \
-  --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
-  --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
-  --block-ssd-cache-max-size 50 \
-  --log-level DEBUG \
-  --prompt-cache-size 10
-```
 
 > **Debug mode** — pipe server logs to a file for post-mortem analysis:
 > ```bash
