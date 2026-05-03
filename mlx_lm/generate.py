@@ -58,6 +58,7 @@ DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
 
 
+HARD_CAP = 131072  # absolute ceiling regardless of max_tokens
 def str2bool(string):
     return string.lower() not in ["false", "f"]
 
@@ -496,13 +497,14 @@ def generate_step(
     mx.async_eval(y, logprobs)
     n = 0
     while True:
-        if n != max_tokens:
+        should_stop = (max_tokens != -1 and n == max_tokens) or n > HARD_CAP
+        if not should_stop:
             next_y, next_logprobs = _step(y)
             mx.async_eval(next_y, next_logprobs)
         if n == 0:
             mx.eval(y)
             prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
-        if n == max_tokens:
+        if should_stop:
             break
         yield y.item(), logprobs
         if n % 256 == 0:
@@ -771,7 +773,7 @@ def stream_generate(
                 break
 
             detokenizer.add_token(token)
-            if (n + 1) == max_tokens:
+            if (max_tokens != -1 and (n + 1) == max_tokens) or n >= HARD_CAP:
                 break
 
             yield GenerationResponse(
