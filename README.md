@@ -34,21 +34,18 @@ mlx_lm.server \
   --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
   --block-ssd-cache-max-size 50 \
   --prompt-cache-size 10
+
+# Or launch with thinking (model shows reasoning before answering)
+python3 -m mlx_lm server \
+  --model ~/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
+  --host 127.0.0.1 --port 8000 \
+  --chat-template-args '{"enable_thinking":true, "preserve_thinking": true}' \
+  --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
+  --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
+  --block-ssd-cache-max-size 50 \
+  --log-level DEBUG \
+  --prompt-cache-size 10 2>&1 | tee /tmp/server_bench.log
 ```
-> **Thinking mode** — model shows its reasoning before answering:
-> ```bash
-> python3 -m mlx_lm server \
->   --model ~/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
->   --host 127.0.0.1 --port 8000 \
->   --chat-template-args '{"enable_thinking":true, "preserve_thinking": true}' \
->   --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
->   --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
->   --block-ssd-cache-max-size 50 \
->   --log-level DEBUG \
->   --prompt-cache-size 10 2>&1 | tee /tmp/server_bench.log
-> ```
-
-
 ---
 
 ## 1. KV Cache Quantization — Fit More Context in Less RAM
