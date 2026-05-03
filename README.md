@@ -16,8 +16,16 @@ This fork solves that from four angles.
 ## Quick Start
 
 ```bash
+# 1. Clone the fork
+git clone https://github.com/shivam2014/mlx-lm.git mlx-lm-vanilla
+cd mlx-lm-vanilla/mlx-lm
+
+# 2. Create virtual environment and install
+python3 -m venv venv
+source venv/bin/activate
 pip install -e .
 
+# 3. Launch server (no thinking)
 mlx_lm.server \
   --model ~/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
   --host 127.0.0.1 --port 8000 \
@@ -29,16 +37,15 @@ mlx_lm.server \
 ```
 > **Thinking mode** — model shows its reasoning before answering:
 > ```bash
-> cd /Users/shivam94/mlx-lm-vanilla/mlx-lm
-> /Users/shivam94/mlx-lm-vanilla/venv/bin/python3 -m mlx_lm server \
->   --model /Users/shivam94/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
+> python3 -m mlx_lm server \
+>   --model ~/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
 >   --host 127.0.0.1 --port 8000 \
 >   --chat-template-args '{"enable_thinking":true, "preserve_thinking": true}' \
 >   --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
 >   --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
 >   --block-ssd-cache-max-size 50 \
 >   --log-level DEBUG \
->   --prompt-cache-size 10
+>   --prompt-cache-size 10 2>&1 | tee /tmp/server_bench.log
 > ```
 
 
@@ -259,9 +266,8 @@ The response will include a `reasoning` field alongside `content` in the
 chat completion payload. Full command:
 
 ```bash
-cd /Users/shivam94/mlx-lm-vanilla/mlx-lm
-/Users/shivam94/mlx-lm-vanilla/venv/bin/python3 -m mlx_lm server \
-  --model /Users/shivam94/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
+python3 -m mlx_lm server \
+  --model ~/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
   --host 127.0.0.1 --port 8000 \
   --chat-template-args '{"enable_thinking":true, "preserve_thinking": true}' \
   --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
@@ -273,9 +279,8 @@ cd /Users/shivam94/mlx-lm-vanilla/mlx-lm
 
 > **Debug mode** — pipe server logs to a file for post-mortem analysis:
 > ```bash
-> cd /Users/shivam94/mlx-lm-vanilla/mlx-lm
-> /Users/shivam94/mlx-lm-vanilla/venv/bin/python3 -m mlx_lm server \
->   --model /Users/shivam94/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
+> python3 -m mlx_lm server \
+>   --model ~/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
 >   --host 127.0.0.1 --port 8000 \
 >   --chat-template-args '{"enable_thinking":true, "preserve_thinking": true}' \
 >   --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
