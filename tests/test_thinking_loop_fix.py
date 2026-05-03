@@ -258,3 +258,103 @@ class TestCombinedBehavior(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# =========================================================================
+# Tests for BatchGenerator.next() fix (Bug C)
+# =========================================================================
+
+def _batch_should_stop(num_tokens: int, max_tokens: int) -> bool:
+    """Replica of the corrected break condition in BatchGenerator.next().
+
+    BatchGenerator.next() increments _num_tokens[i] first, THEN checks.
+    So num_tokens here means the count AFTER incrementing (min value = 1).
+    Uses n > HARD_CAP (exclusive) like generate_step.
+    """
+    if max_tokens != -1 and num_tokens >= max_tokens:
+        return True
+    if num_tokens > HARD_CAP:
+        return True
+    return False
+
+
+class TestBatchGeneratorFix(unittest.TestCase):
+    """Test the Bug C fix in BatchGenerator.next().
+
+    Bug C: `if self._num_tokens[i] >= self.max_tokens[i]`
+    When max_tokens=-1: 1 >= -1 is True → caps at 1 token immediately.
+
+    Fix: `if (self.max_tokens[i] != -1 and self._num_tokens[i] >= self.max_tokens[i]) or self._num_tokens[i] > HARD_CAP`
+    """
+
+    def test_neg1_does_not_cap_at_one_token(self):
+        """max_tokens=-1 with _num_tokens=1 should NOT stop.
+        This was the original bug: 1 >= -1 was True."""
+        self.assertFalse(
+            _batch_should_stop(1, -1),
+            "num_tokens=1 with max_tokens=-1 should not stop",
+        )
+
+    def test_neg1_allows_many_tokens(self):
+        """max_tokens=-1 should never stop for normal token counts."""
+        for n in [1, 10, 100, 50000, 100000, 131071]:
+            self.assertFalse(
+                _batch_should_stop(n, -1),
+                f"_batch_should_stop({n}, -1) should be False",
+            )
+
+    def test_neg1_stops_at_hard_cap(self):
+        """max_tokens=-1 with _num_tokens > HARD_CAP should stop."""
+        self.assertTrue(_batch_should_stop(HARD_CAP + 1, -1))
+        self.assertTrue(_batch_should_stop(200000, -1))
+
+    def test_neg1_does_not_stop_at_exact_hard_cap(self):
+        """max_tokens=-1 with _num_tokens == HARD_CAP should NOT stop
+        (uses n > HARD_CAP, same as generate_step)."""
+        self.assertFalse(_batch_should_stop(HARD_CAP, -1))
+
+    def test_normal_limit_stops_at_limit(self):
+        """When max_tokens=100 and _num_tokens=100, should stop."""
+        self.assertTrue(_batch_should_stop(100, 100))
+
+    def test_normal_limit_below(self):
+        """When max_tokens=100 and _num_tokens=99, should NOT stop."""
+        self.assertFalse(_batch_should_stop(99, 100))
+
+    def test_zero_max_tokens_stops_immediately(self):
+        """max_tokens=0 with _num_tokens=1 should stop immediately.
+        (num_tokens starts at 0, gets incremented to 1 before check.)"""
+        self.assertTrue(_batch_should_stop(1, 0))
+
+    def test_hard_cap_overrides_positive_limit(self):
+        """If _num_tokens exceeds HARD_CAP, should stop even if max_tokens is higher."""
+        self.assertTrue(_batch_should_stop(HARD_CAP + 1, 999999))
+
+    def test_various_legitimate_limits(self):
+        """Various limits that should work correctly."""
+        for limit in [1, 10, 256, 4096, 65536]:
+            self.assertTrue(_batch_should_stop(limit, limit))
+            self.assertFalse(_batch_should_stop(limit - 1, limit))
+
+    def test_batch_flow_with_neg1(self):
+        """Simulate the full BatchGenerator flow with max_tokens=-1.
+        Should never stop until HARD_CAP is exceeded."""
+        num_tokens = 0
+        for _ in range(100):
+            num_tokens += 1  # _num_tokens[i] += 1
+            if _batch_should_stop(num_tokens, -1):
+                self.fail(f"Batch flow stopped early at num_tokens={num_tokens} with max_tokens=-1")
+        # Should reach 100 tokens without stopping
+        self.assertEqual(num_tokens, 100)
+
+    def test_batch_flow_with_positive_limit(self):
+        """Simulate the full BatchGenerator flow with max_tokens=50.
+        Should stop exactly at 50 tokens."""
+        num_tokens = 0
+        for _ in range(200):
+            num_tokens += 1  # _num_tokens[i] += 1
+            if _batch_should_stop(num_tokens, 50):
+                self.assertEqual(num_tokens, 50)
+                break
+        else:
+            self.fail("Batch flow did not stop at max_tokens=50")
