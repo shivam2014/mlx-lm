@@ -652,7 +652,7 @@ def speculative_generate_step(
             mx.clear_cache()
         return y
 
-    def _prefill_mtp(model, cache, y):
+    def _prefill_mtp(model, mc, y):
         """Prefill like _prefill but return last hidden state for MTP.
         
         After prefill, processes one extra token forward to get its hidden
@@ -661,17 +661,17 @@ def speculative_generate_step(
         """
         while y.size > 1:
             n_to_process = min(prefill_step_size, y.size - 1)
-            model(y[:n_to_process][None], cache=cache)
-            quantize_cache_fn(cache)
-            mx.eval([c.state for c in cache])
+            model(y[:n_to_process][None], cache=mc)
+            quantize_cache_fn(mc)
+            mx.eval([c.state for c in mc])
             y = y[n_to_process:]
             mx.clear_cache()
         # Feed the last token to get its hidden state
-        _, h = model(y[-1:].reshape(1, 1), cache=cache, return_hidden=True)
+        _, h = model(y[-1:].reshape(1, 1), cache=mc, return_hidden=True)
         mx.eval(h)
         h_last = h[:, -1:, :]
         # Undo cache advancement so verify starts at correct position
-        cache.trim_prompt_cache(cache, 1)
+        cache.trim_prompt_cache(mc, 1)
         return h_last
 
     def _rewind_cache(num_draft, num_accept):
