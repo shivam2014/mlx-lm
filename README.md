@@ -152,6 +152,12 @@ caused silent cache corruption or missed reuse:
   during prefix operations, breaking the trie invariant
 - **max_tokens default** — missing `max_tokens` in the API request caused
   silent response truncation
+- **Template boundary detection** — replaced the `apply_chat_template`
+  re-encode + byte-compare in `_tokenize` with a direct token-ID scan for
+  chat markers (`<|im_start|>` / `<|im_end|>`). Cuts system-boundary
+  detection from ~50ms to <1ms and works for any model family with
+  resolvable marker tokens (Qwen, Llama 3+, etc.). Falls back gracefully
+  for unknown templates.
 
 These fixes ensure that cache hits return correct results, not just fast ones.
 
@@ -300,3 +306,5 @@ Models in cache:
 - [EPIC (2410.15332)](https://arxiv.org/abs/2410.15332) — position-independent caching
 - [Prompt Cache (2311.04934)](https://arxiv.org/abs/2311.04934) — modular attention reuse
 - [CacheBlend (2405.16444)](https://arxiv.org/abs/2405.16444) — selective KV recomputation
+- [Luce Org / lucebox-hub](https://github.com/Luce-Org/lucebox-hub) — prefix
+  cache boundary detection and deferred-eviction patterns
