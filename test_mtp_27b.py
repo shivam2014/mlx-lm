@@ -32,8 +32,7 @@ def main():
     # Load MTP weights and inject into model
     print(f"Loading MTP weights from {args.mtp_weights}...")
     mtp_weights = mx.load(args.mtp_weights)
-    mtp_weights_list = list(mtp_weights.items())
-    
+
     # Fixup RMSNorm weights: HF stores as offsets (actual = 1 + stored).
     # We detect this by checking mean < 0.5 and add +1.0 if needed.
     _MTP_NORM_SUFFIXES = (
@@ -42,26 +41,21 @@ def main():
         '.pre_fc_norm_hidden.weight', '.pre_fc_norm_embedding.weight',
         '.norm.weight',
     )
+    def _is_norm_key(key):
+        """Check norm key with or without leading dot (bare vs prefixed keys)"""
+        for s in _MTP_NORM_SUFFIXES:
+            if key.endswith(s) or key.endswith(s.lstrip('.')):
+                return True
+        return False
     for key, val in mtp_weights.items():
-        if val.ndim == 1 and any(key.endswith(s) for s in _MTP_NORM_SUFFIXES):
+        if val.ndim == 1 and _is_norm_key(key):
             if val.mean().item() < 0.5:
                 mtp_weights[key] = val + 1.0
-    mtp_weights_list = list(mtp_weights.items())
     
-    # Load weights into the MTP module (non-strict to allow partial matches)
-    model.mtp.load_weights(mtp_weights_list, strict=False)
-    # load_weights on sub-modules may not update RMSNorm params.
-    # Directly assign fixupped norm weights.
-    for k, v in mtp_weights.items():
-        if v.ndim == 1:
-            parts = k.split(".")
-            target = model.mtp
-            for p in parts[:-1]:
-                if p.isdigit():
-                    target = target[int(p)]
-                else:
-                    target = getattr(target, p)
-            setattr(target, parts[-1], v)
+    # Load weights into the MTP module using tree_unflatten + update
+    # (load_weights doesn't handle bare keys correctly with @ModuleInfo)
+    from mlx.utils import tree_unflatten
+    model.mtp.update(tree_unflatten(list(mtp_weights.items())))
     print(f"✅ Injected {len(mtp_weights)} MTP weight tensors")
 
     # Tokenize
