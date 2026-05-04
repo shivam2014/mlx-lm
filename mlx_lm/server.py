@@ -1051,6 +1051,7 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                mtp=getattr(self.cli_args, "mtp", False),
                 **kv_kwargs,
             ):
                 finish_reason = gen.finish_reason
@@ -1987,6 +1988,7 @@ def build_server_parser():
     parser.add_argument("--quantized-kv-start", type=int, default=0, help="Step to start quantizing KV cache")
     parser.add_argument("--kv-boundary-layers", type=int, default=2, help="Number of boundary KV layers")
     parser.add_argument("--kv-boundary-bits", type=lambda s: eval(s) if s.startswith("(") else int(s), default=(8,8), help="KV boundary bits")
+    parser.add_argument("--mtp", action="store_true", help="Use native Multi-Token Prediction for speculative decoding (requires a model with an MTP head)")
     parser.add_argument("--prompt-cache-size", type=int, default=0, help="Prompt cache size")
     parser.add_argument("--prompt-cache-bytes", type=int, default=0, help="Prompt cache bytes")
     parser.add_argument("--context-length", type=int, default=None, help="Context length")
