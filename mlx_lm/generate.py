@@ -688,6 +688,12 @@ def speculative_generate_step(
                          return_hidden=True)
             mx.eval(h)
             current_hidden = h[:, -1:, :]
+            # Reset MTP KV cache: clear stale entries from previous rounds
+            # so RoPE offsets start at 0 and auto-increment naturally.
+            for c in draft_cache:
+                c.keys = None
+                c.values = None
+                c.offset = 0
             ys = []
             for _ in range(num_draft):
                 # MTP forward
