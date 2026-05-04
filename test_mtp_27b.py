@@ -50,6 +50,18 @@ def main():
     
     # Load weights into the MTP module (non-strict to allow partial matches)
     model.mtp.load_weights(mtp_weights_list, strict=False)
+    # load_weights on sub-modules may not update RMSNorm params.
+    # Directly assign fixupped norm weights.
+    for k, v in mtp_weights.items():
+        if v.ndim == 1:
+            parts = k.split(".")
+            target = model.mtp
+            for p in parts[:-1]:
+                if p.isdigit():
+                    target = target[int(p)]
+                else:
+                    target = getattr(target, p)
+            setattr(target, parts[-1], v)
     print(f"✅ Injected {len(mtp_weights)} MTP weight tensors")
 
     # Tokenize
