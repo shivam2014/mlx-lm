@@ -713,6 +713,8 @@ def speculative_generate_step(
             # Trim the one-step backbone forward — it's just for hidden state
             # The verify step will process prompt+draft properly
             cache.trim_prompt_cache(model_cache, 1)
+            if not ys:
+                return mx.array([], mx.uint32)
             return mx.concatenate(ys)
 
     with mx.stream(generation_stream):
