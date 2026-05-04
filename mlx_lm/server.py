@@ -1988,14 +1988,10 @@ def build_server_parser():
     parser.add_argument("--quantized-kv-start", type=int, default=0, help="Step to start quantizing KV cache")
     parser.add_argument("--prefill-step-size", type=int, default=512, help="Prefill step size")
     parser.add_argument("--prompt-cache-size", type=int, default=0, help="Prompt cache size")
-    parser.add_argument("--prompt-cache-bytes", type=int, default=0, help="Prompt cache bytes")
     parser.add_argument("--context-length", type=int, default=None, help="Context length")
     parser.add_argument("--cache-loop", action="store_true", help="Enable cache loop mode")
     parser.add_argument("--block-ssd-cache-dir", type=str, default=None, help="Block SSD cache directory")
     parser.add_argument("--block-ssd-cache-max-size", type=int, default=50, help="Block SSD cache max size in GB")
-    parser.add_argument("--pipeline", type=str, default=None, help="Pipeline for distributed inference")
-    parser.add_argument("--decode-concurrency", type=int, default=32, help="Number of requests to decode in parallel")
-    parser.add_argument("--prompt-concurrency", type=int, default=8, help="Number of prompts to process in parallel")
     return parser
 
 def main():
