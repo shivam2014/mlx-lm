@@ -516,7 +516,7 @@ def generate_step(
 def speculative_generate_step(
     prompt: mx.array,
     model: nn.Module,
-    draft_model: nn.Module,
+    draft_model: Optional[nn.Module] = None,
     *,
     num_draft_tokens: int = 2,
     max_tokens: int = 256,
@@ -568,12 +568,19 @@ def speculative_generate_step(
     prev_tokens = None
 
     # Create the KV cache for generation
+    use_mtp = draft_model is None and hasattr(model, 'mtp')
     if prompt_cache is None:
         model_cache = cache.make_prompt_cache(model)
-        draft_cache = cache.make_prompt_cache(draft_model)
+        if use_mtp:
+            draft_cache = model.make_mtp_cache()
+        else:
+            draft_cache = cache.make_prompt_cache(draft_model)
     else:
         model_cache = prompt_cache[: len(model.layers)]
-        draft_cache = prompt_cache[len(model.layers) :]
+        if use_mtp:
+            draft_cache = model.make_mtp_cache()
+        else:
+            draft_cache = prompt_cache[len(model.layers) :]
 
     if not cache.can_trim_prompt_cache(model_cache):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
@@ -639,11 +646,14 @@ def speculative_generate_step(
 
     def _rewind_cache(num_draft, num_accept):
         cache.trim_prompt_cache(model_cache, num_draft - num_accept)
-        cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+        if not use_mtp:
+            cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
 
     def _draft_generate(y, num_draft):
         if num_draft == 0:
             return mx.array([], mx.uint32)
+        if use_mtp:
+            return _mtp_draft_generate(y, num_draft)
         ys = []
         for _ in range(num_draft):
             y, _ = _step(draft_model, draft_cache, y)
@@ -651,9 +661,47 @@ def speculative_generate_step(
             ys.append(y)
         return mx.concatenate(ys)
 
+    def _mtp_draft_generate(y, num_draft):
+        """Generate draft tokens using MTP head, no separate draft model."""
+        if num_draft == 0:
+            return mx.array([], mx.uint32)
+        # Get backbone hidden state for the current position
+        # y is the last prompt token; run backbone one step to get hidden
+        with mx.stream(generation_stream):
+            # Re-use the cached mtp cache from draft_cache
+            last_token = y[-1:]
+            _, h = model(last_token[None], cache=model_cache,
+                         return_hidden=True)
+            mx.eval(h)
+            current_hidden = h[:, -1:, :]
+            ys = []
+            for _ in range(num_draft):
+                # MTP forward
+                mtp_out = model.mtp(
+                    current_hidden, last_token,
+                    model.language_model.model.embed_tokens,
+                    cache=draft_cache,
+                )
+                if model.language_model.args.tie_word_embeddings:
+                    mtp_logits = model.language_model.model.embed_tokens.as_linear(mtp_out)
+                else:
+                    mtp_logits = model.language_model.lm_head(mtp_out)
+                next_token = sampler(mtp_logits[:, -1, :])
+                ys.append(next_token)
+                last_token = next_token
+                current_hidden = mtp_out  # MTP hidden feeds next step
+            # Trim the one-step backbone forward — it's just for hidden state
+            # The verify step will process prompt+draft properly
+            cache.trim_prompt_cache(model_cache, 1)
+            return mx.concatenate(ys)
+
     with mx.stream(generation_stream):
-        draft_y = _prefill(draft_model, draft_cache, y)
-        y = _prefill(model, model_cache, y)
+        if use_mtp:
+            y = _prefill(model, model_cache, y)
+            draft_y = y  # MTP starts from the same last token
+        else:
+            draft_y = _prefill(draft_model, draft_cache, y)
+            y = _prefill(model, model_cache, y)
 
     # Snapshot SSM+KV states before verify for rollback on partial rejection.
     for c in model_cache:
@@ -770,7 +818,8 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
+    use_mtp = draft_model is None and hasattr(model, 'mtp')
+    if draft_model is None and not use_mtp:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
