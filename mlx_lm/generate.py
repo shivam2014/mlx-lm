@@ -746,6 +746,7 @@ def speculative_generate_step(
                 return mx.array([], mx.uint32)
             return mx.concatenate(ys)
 
+    _last_hidden = None
     with mx.stream(generation_stream):
         if use_mtp:
             _last_hidden = _prefill_mtp(model, model_cache, y)
@@ -758,7 +759,6 @@ def speculative_generate_step(
     # Detect hybrid models (Qwen3.5) with non-trimmable ArraysCache.
     _has_arrays = any(isinstance(c, cache.ArraysCache) for c in model_cache)
     _verify_input = None
-    _last_hidden = None
 
     ntoks = 0
     # Set these so the finally block doesn't raise
