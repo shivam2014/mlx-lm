@@ -1024,7 +1024,7 @@ class ArraysCache(_BaseCache):
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
-        self._rollback_state = None
+        self._checkpoint = None
         if left_padding:
             self.left_padding = mx.array(left_padding)
 
@@ -1148,16 +1148,20 @@ class ArraysCache(_BaseCache):
     def is_trimmable(self):
         return True
 
-    def arm_rollback(self) -> None:
-        """Snapshot current SSM+conv state for speculative decode rollback."""
-        if self.cache[0] is not None:
-            self._rollback_state = [mx.copy(a) for a in self.cache[:2]]
+    def checkpoint(self) -> None:
+        """Save current SSM+conv state for speculative decode rollback.
+        
+        Saves references to current state arrays. During the verify forward,
+        cache entries are replaced with new arrays (MLX arrays are immutable),
+        so the saved references stay valid — no GPU memory copy needed.
+        """
+        self._checkpoint = list(self.cache)
 
-    def rollback(self) -> None:
-        """Restore SSM+conv state from the arm_rollback snapshot."""
-        if self._rollback_state is not None:
-            self.cache = self._rollback_state
-            self._rollback_state = None
+    def restore(self) -> None:
+        """Restore SSM+conv state from checkpoint, if one exists."""
+        if self._checkpoint is not None:
+            self.cache = self._checkpoint
+            self._checkpoint = None
 
     def trim(self, n):
         # ArraysCache stores static per-layer features with no offset.

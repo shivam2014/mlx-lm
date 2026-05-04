@@ -650,16 +650,16 @@ def speculative_generate_step(
             cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
         if not (_has_arrays and num_draft > num_accept):
             return
-        snap = _hybrid_snap
-        if not snap["arrays"] or snap["verify_input"] is None:
+        # Replay accepted tokens to recompute SSM state after rollback.
+        # ArraysCache.restore() reverts to pre-verify SSM state, then the
+        # replay advances it by num_accept + 1 steps through the full model.
+        needs_replay = False
+        for c in model_cache:
+            if isinstance(c, cache.ArraysCache):
+                needs_replay |= c.restore()
+        if not needs_replay:
             return
-        for i, c in enumerate(model_cache):
-            if isinstance(c, cache.KVCache):
-                if i in snap["kv_offsets"]:
-                    c.offset = snap["kv_offsets"][i]
-            elif isinstance(c, cache.ArraysCache) and i in snap["arrays"]:
-                c.cache = list(snap["arrays"][i])
-        y_acc = snap["verify_input"][:num_accept + 1]
+        y_acc = _verify_input[:num_accept + 1]
         with mx.stream(generation_stream):
             model(y_acc[None], cache=model_cache)
 
@@ -725,18 +725,7 @@ def speculative_generate_step(
 
     # Detect hybrid models (Qwen3.5) with non-trimmable ArraysCache.
     _has_arrays = any(isinstance(c, cache.ArraysCache) for c in model_cache)
-    _hybrid_snap = {"arrays": {}, "kv_offsets": {}, "verify_input": None}
-
-    def _save_hybrid_snap(verify_input):
-        _hybrid_snap["verify_input"] = verify_input
-        _hybrid_snap["arrays"] = {
-            i: list(c.cache) for i, c in enumerate(model_cache)
-            if isinstance(c, cache.ArraysCache)
-        }
-        _hybrid_snap["kv_offsets"] = {
-            i: c.offset for i, c in enumerate(model_cache)
-            if isinstance(c, cache.KVCache)
-        }
+    _verify_input = None
 
     ntoks = 0
     # Set these so the finally block doesn't raise
@@ -749,8 +738,11 @@ def speculative_generate_step(
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
             y = mx.concatenate([y, draft_tokens])
+            _verify_input = y
             if _has_arrays:
-                _save_hybrid_snap(y)
+                for c in model_cache:
+                    if isinstance(c, cache.ArraysCache):
+                        c.checkpoint()
             tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
             mx.eval(tokens, draft_tokens)
             draft_tokens = draft_tokens.tolist()
