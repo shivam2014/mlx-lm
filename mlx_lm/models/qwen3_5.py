@@ -378,7 +378,7 @@ class TextModel(nn.Module):
         )
         should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
         # Strip MTP weights from backbone — they're loaded separately
-        weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        # MTP weights pass through sanitize normally.
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -501,18 +501,7 @@ class Model(nn.Module):
                 key = "language_model." + key
             sanitized[key] = value
 
-        # Pass mtp weights through if MTP module is present
-        if hasattr(self, "mtp") and hasattr(getattr(self, "language_model", None), "mtp"):
-            mtp_weights = {}
-            for k, v in list(sanitized.items()):
-                if k.startswith("language_model.model.mtp.") or k.startswith("language_model.mtp."):
-                    mtp_key = k.replace("language_model.model.mtp.", "mtp.")
-                    mtp_key = mtp_key.replace("language_model.mtp.", "mtp.")
-                    mtp_weights[mtp_key] = v
-                    del sanitized[k]
-            if mtp_weights:
-                mtp_weights = self.language_model.sanitize(mtp_weights)
-                sanitized.update(mtp_weights)
+        # MTP weights pass through sanitize normally (no re-mapping needed).
         return self.language_model.sanitize(sanitized)
 
     def shard(self, group=None):

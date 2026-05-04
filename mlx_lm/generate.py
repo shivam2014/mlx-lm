@@ -648,6 +648,20 @@ def speculative_generate_step(
         cache.trim_prompt_cache(model_cache, num_draft - num_accept)
         if not use_mtp:
             cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+        if not (_has_arrays and num_draft > num_accept):
+            return
+        snap = _hybrid_snap
+        if not snap["arrays"] or snap["verify_input"] is None:
+            return
+        for i, c in enumerate(model_cache):
+            if isinstance(c, cache.KVCache):
+                if i in snap["kv_offsets"]:
+                    c.offset = snap["kv_offsets"][i]
+            elif isinstance(c, cache.ArraysCache) and i in snap["arrays"]:
+                c.cache = list(snap["arrays"][i])
+        y_acc = snap["verify_input"][:num_accept + 1]
+        with mx.stream(generation_stream):
+            model(y_acc[None], cache=model_cache)
 
     def _draft_generate(y, num_draft):
         if num_draft == 0:
@@ -703,13 +717,20 @@ def speculative_generate_step(
             draft_y = _prefill(draft_model, draft_cache, y)
             y = _prefill(model, model_cache, y)
 
-    # Snapshot SSM+KV states before verify for rollback on partial rejection.
-    for c in model_cache:
-        if hasattr(c, 'arm_rollback'):
-            c.arm_rollback()
-    for c in draft_cache:
-        if hasattr(c, 'arm_rollback'):
-            c.arm_rollback()
+    # Detect hybrid models (Qwen3.5) with non-trimmable ArraysCache.
+    _has_arrays = any(isinstance(c, cache.ArraysCache) for c in model_cache)
+    _hybrid_snap = {"arrays": {}, "kv_offsets": {}, "verify_input": None}
+
+    def _save_hybrid_snap(verify_input):
+        _hybrid_snap["verify_input"] = verify_input
+        _hybrid_snap["arrays"] = {
+            i: list(c.cache) for i, c in enumerate(model_cache)
+            if isinstance(c, cache.ArraysCache)
+        }
+        _hybrid_snap["kv_offsets"] = {
+            i: c.offset for i, c in enumerate(model_cache)
+            if isinstance(c, cache.KVCache)
+        }
 
     ntoks = 0
     # Set these so the finally block doesn't raise
@@ -722,6 +743,8 @@ def speculative_generate_step(
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
             y = mx.concatenate([y, draft_tokens])
+            if _has_arrays:
+                _save_hybrid_snap(y)
             tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
             mx.eval(tokens, draft_tokens)
             draft_tokens = draft_tokens.tolist()
@@ -757,21 +780,8 @@ def speculative_generate_step(
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
             _rewind_cache(num_draft, n)
-            # Restore SSM states rolled back by _rewind_cache
-            for c in model_cache:
-                if hasattr(c, 'rollback'):
-                    c.rollback()
-            for c in draft_cache:
-                if hasattr(c, 'rollback'):
-                    c.rollback()
     finally:
         _rewind_cache(num_draft, n)
-        for c in model_cache:
-            if hasattr(c, 'rollback'):
-                c.rollback()
-        for c in draft_cache:
-            if hasattr(c, 'rollback'):
-                c.rollback()
 
 
 def stream_generate(
