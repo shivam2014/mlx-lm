@@ -326,7 +326,7 @@ class Qwen3_5TextModel(nn.Module):
 
         normed = self.norm(hidden_states)
         if return_hidden:
-            return normed, hidden_states
+            return normed, normed  # post-norm hidden (MTP expects this)
         return normed
 
 

@@ -7,7 +7,7 @@ import time
 import json
 import mlx.core as mx
 from mlx_lm import load
-from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.cache import ArraysCache, make_prompt_cache
 
 
 def main():
@@ -34,6 +34,20 @@ def main():
     mtp_weights = mx.load(args.mtp_weights)
     mtp_weights_list = list(mtp_weights.items())
     
+    # Fixup RMSNorm weights: HF stores as offsets (actual = 1 + stored).
+    # We detect this by checking mean < 0.5 and add +1.0 if needed.
+    _MTP_NORM_SUFFIXES = (
+        '.input_layernorm.weight', '.post_attention_layernorm.weight',
+        '.q_norm.weight', '.k_norm.weight',
+        '.pre_fc_norm_hidden.weight', '.pre_fc_norm_embedding.weight',
+        '.norm.weight',
+    )
+    for key, val in mtp_weights.items():
+        if val.ndim == 1 and any(key.endswith(s) for s in _MTP_NORM_SUFFIXES):
+            if val.mean().item() < 0.5:
+                mtp_weights[key] = val + 1.0
+    mtp_weights_list = list(mtp_weights.items())
+    
     # Load weights into the MTP module (non-strict to allow partial matches)
     model.mtp.load_weights(mtp_weights_list, strict=False)
     print(f"✅ Injected {len(mtp_weights)} MTP weight tensors")
@@ -53,6 +67,15 @@ def main():
     generated = [int(backbone_token.item())]
     last_hidden = h[:, -1:, :]
     mtp_cache = model.make_mtp_cache()
+    # Align MTP cache RoPE offset with backbone position (Tom Turney bug #3)
+    # The MTP decoder attention uses cache.offset for RoPE. It must match
+    # the backbone position (current generated token count + prompt_len).
+    _first_offset = next(
+        c.offset for c in backbone_cache
+        if hasattr(c, "offset") and not isinstance(c, ArraysCache)
+    )
+    for c in mtp_cache:
+        c.offset = int(_first_offset)
 
     mtp_correct = 0
     mtp_total = 0
