@@ -608,9 +608,12 @@ def speculative_generate_step(
         y = sampler(logprobs)
         return y, logprobs
 
-    def _step(model, cache, y, n_predict=1):
+    def _step(model, cache, y, n_predict=1, return_hidden_last=False):
         with mx.stream(generation_stream):
-            logits = model(y[None], cache=cache)
+            if return_hidden_last:
+                logits, last_hidden = model(y[None], cache=cache, return_hidden=True)
+            else:
+                logits = model(y[None], cache=cache)
             logits = logits[:, -n_predict:, :]
 
             quantize_cache_fn(cache)
@@ -628,11 +631,16 @@ def speculative_generate_step(
                     y, logprobs = _process_and_sample(prev_tokens, logits[:, i, :])
                     out_y.append(y)
                     out_logprobs.append(logprobs)
-                return mx.concatenate(out_y, axis=0), mx.concatenate(
-                    out_logprobs, axis=0
-                )
+                toks = mx.concatenate(out_y, axis=0)
+                lps = mx.concatenate(out_logprobs, axis=0)
+                if return_hidden_last:
+                    return toks, lps, last_hidden
+                return toks, lps
             else:
-                return _process_and_sample(None, logits.squeeze(0))
+                toks, lps = _process_and_sample(None, logits.squeeze(0))
+                if return_hidden_last:
+                    return toks, lps, last_hidden[:, -1:, :]
+                return toks, lps
 
     def _prefill(model, cache, y):
         while y.size > 1:
@@ -643,6 +651,28 @@ def speculative_generate_step(
             y = y[n_to_process:]
             mx.clear_cache()
         return y
+
+    def _prefill_mtp(model, cache, y):
+        """Prefill like _prefill but return last hidden state for MTP.
+        
+        After prefill, processes one extra token forward to get its hidden
+        state, then trims the cache back so verify starts from the correct
+        offset (prompt_len - 1).
+        """
+        while y.size > 1:
+            n_to_process = min(prefill_step_size, y.size - 1)
+            model(y[:n_to_process][None], cache=cache)
+            quantize_cache_fn(cache)
+            mx.eval([c.state for c in cache])
+            y = y[n_to_process:]
+            mx.clear_cache()
+        # Feed the last token to get its hidden state
+        _, h = model(y[-1:].reshape(1, 1), cache=cache, return_hidden=True)
+        mx.eval(h)
+        h_last = h[:, -1:, :]
+        # Undo cache advancement so verify starts at correct position
+        cache.trim_prompt_cache(cache, 1)
+        return h_last
 
     def _rewind_cache(num_draft, num_accept):
         cache.trim_prompt_cache(model_cache, num_draft - num_accept)
@@ -663,11 +693,11 @@ def speculative_generate_step(
         with mx.stream(generation_stream):
             model(y_acc[None], cache=model_cache)
 
-    def _draft_generate(y, num_draft):
+    def _draft_generate(y, num_draft, last_hidden=None):
         if num_draft == 0:
             return mx.array([], mx.uint32)
         if use_mtp:
-            return _mtp_draft_generate(y, num_draft)
+            return _mtp_draft_generate(y, num_draft, last_hidden)
         ys = []
         for _ in range(num_draft):
             y, _ = _step(draft_model, draft_cache, y)
@@ -675,19 +705,21 @@ def speculative_generate_step(
             ys.append(y)
         return mx.concatenate(ys)
 
-    def _mtp_draft_generate(y, num_draft):
-        """Generate draft tokens using MTP head, no separate draft model."""
+    def _mtp_draft_generate(y, num_draft, last_hidden):
+        """Generate draft tokens using MTP head, no separate draft model.
+        
+        Args:
+            y: Last accepted/correction token (1D array).
+            num_draft: Number of draft tokens to generate.
+            last_hidden: Backbone hidden state after processing the last
+                accepted token (from _step's verify pass). Eliminates the
+                expensive extra model() call previously needed.
+        """
         if num_draft == 0:
             return mx.array([], mx.uint32)
-        # Get backbone hidden state for the current position
-        # y is the last prompt token; run backbone one step to get hidden
         with mx.stream(generation_stream):
-            # Re-use the cached mtp cache from draft_cache
-            last_token = y[-1:].reshape(1, 1)  # [1, 1] for embed_tokens(batch, seq)
-            _, h = model(last_token, cache=model_cache,
-                         return_hidden=True)
-            mx.eval(h)
-            current_hidden = h[:, -1:, :]
+            current_hidden = last_hidden  # [1, 1, hidden_dim]
+            last_token = y[-1:].reshape(1, 1)  # [1, 1]
             # Reset MTP KV cache: clear stale entries from previous rounds
             # so RoPE offsets start at 0 and auto-increment naturally.
             for c in draft_cache:
@@ -710,16 +742,14 @@ def speculative_generate_step(
                 ys.append(next_token)
                 last_token = next_token.reshape(1, 1)  # [1,1] for embed_tokens
                 current_hidden = mtp_out  # MTP hidden feeds next step
-            # Trim the one-step backbone forward — it's just for hidden state
-            # The verify step will process prompt+draft properly
-            cache.trim_prompt_cache(model_cache, 1)
             if not ys:
                 return mx.array([], mx.uint32)
             return mx.concatenate(ys)
 
     with mx.stream(generation_stream):
         if use_mtp:
-            y = _prefill(model, model_cache, y)
+            _last_hidden = _prefill_mtp(model, model_cache, y)
+            y = y[-1:]  # last prompt token
             draft_y = y  # MTP starts from the same last token
         else:
             draft_y = _prefill(draft_model, draft_cache, y)
@@ -728,6 +758,7 @@ def speculative_generate_step(
     # Detect hybrid models (Qwen3.5) with non-trimmable ArraysCache.
     _has_arrays = any(isinstance(c, cache.ArraysCache) for c in model_cache)
     _verify_input = None
+    _last_hidden = None
 
     ntoks = 0
     # Set these so the finally block doesn't raise
@@ -736,7 +767,10 @@ def speculative_generate_step(
     try:
         while True:
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
-            draft_tokens = _draft_generate(draft_y, num_draft)
+            if use_mtp:
+                draft_tokens = _draft_generate(draft_y, num_draft, _last_hidden)
+            else:
+                draft_tokens = _draft_generate(draft_y, num_draft)
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
             y = mx.concatenate([y, draft_tokens])
@@ -745,7 +779,10 @@ def speculative_generate_step(
                 for c in model_cache:
                     if isinstance(c, cache.ArraysCache):
                         c.checkpoint()
-            tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
+            if use_mtp:
+                tokens, logprobs, _last_hidden = _step(model, model_cache, y, num_draft + 1, return_hidden_last=True)
+            else:
+                tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
             mx.eval(tokens, draft_tokens)
             draft_tokens = draft_tokens.tolist()
             tokens = tokens.tolist()
@@ -768,6 +805,15 @@ def speculative_generate_step(
 
             y = mx.array([tokens[n]], mx.uint32)
             draft_y = y
+            # On partial rejection, _last_hidden is from the last verify
+            # position (past the correction token). Recompute hidden state
+            # at the correction token position for the next MTP round.
+            if use_mtp and n < num_draft and _last_hidden is not None:
+                _, h = model(y[-1:].reshape(1, 1), cache=model_cache, return_hidden=True)
+                mx.eval(h)
+                _last_hidden = h[:, -1:, :]
+                # Undo the cache advancement from this extra forward
+                cache.trim_prompt_cache(model_cache, 1)
 
             # If we accepted all the draft tokens, include the last
             # draft token in the next draft step since it hasn't been
