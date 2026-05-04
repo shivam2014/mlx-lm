@@ -40,6 +40,7 @@ from .generate import (
     stream_generate,
 )
 from .hermes_prefix_cache import HermesPrefixOptimizer
+from .template_boundary import find_system_boundary, resolve_marker_ids
 from .models.cache import (
     LRUPromptCache,
     SsdCache,
@@ -595,30 +596,42 @@ class ResponseGenerator:
         segments = []
         segment_types = []
 
-        # Find where the system prompt ends and add it as a segment.
-        num_system = 0
+        # Find where the system prompt ends by scanning token markers.
         sys_end = 0
-        for m in messages:
-            if m["role"] == "system":
-                num_system += 1
-            else:
-                break
-        if num_system > 0:
-            sys_tokens = tokenizer.apply_chat_template(
-                messages[:num_system] + [{"role": "user", "content": ""}],
-                add_generation_prompt=False,
-                **template_kwargs,
-            )
-            for i, (a, b) in enumerate(zip(sys_tokens, prompt)):
-                if a != b:
-                    sys_end = i
+        if (
+            getattr(self, "_marker_ids", None) is not None
+            and any(m["role"] == "system" for m in messages)
+        ):
+            boundary = find_system_boundary(prompt, *self._marker_ids)
+            if boundary is not None and boundary > 0 and boundary < len(prompt):
+                sys_end = boundary
+
+        # Fallback: use apply_chat_template re-encode + byte compare
+        # for templates without known markers.
+        if sys_end == 0:
+            num_system = 0
+            for m in messages:
+                if m["role"] == "system":
+                    num_system += 1
+                else:
                     break
-            else:
-                if len(sys_tokens) <= len(prompt):
-                    sys_end = len(sys_tokens)
-            if sys_end > 0 and sys_end < len(prompt):
-                segments.append(prompt[:sys_end])
-                segment_types.append("system")
+            if num_system > 0:
+                sys_tokens = tokenizer.apply_chat_template(
+                    messages[:num_system] + [{"role": "user", "content": ""}],
+                    add_generation_prompt=False,
+                    **template_kwargs,
+                )
+                for i, (a, b) in enumerate(zip(sys_tokens, prompt)):
+                    if a != b:
+                        sys_end = i
+                        break
+                else:
+                    if len(sys_tokens) <= len(prompt):
+                        sys_end = len(sys_tokens)
+
+        if sys_end > 0 and sys_end < len(prompt):
+            segments.append(prompt[:sys_end])
+            segment_types.append("system")
 
         # Find a tail segment that contains thinking tokens (small up to 11
         # tokens)
@@ -723,6 +736,17 @@ class ResponseGenerator:
             logging.info(
                 "Hermes prefix optimizer initialized for block SSD cache"
             )
+        # Resolve chat-template marker token IDs for boundary detection.
+        self._marker_ids = None
+        if self.model_provider.tokenizer is not None:
+            try:
+                self._marker_ids = resolve_marker_ids(
+                    self.model_provider.tokenizer
+                )
+                logging.info(f"Template markers resolved: {self._marker_ids}")
+            except ValueError:
+                self._marker_ids = None
+                logging.info("No marker-based template detected; using fallback path")
 
         current_model = None
         current_sampling = None
