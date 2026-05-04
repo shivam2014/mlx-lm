@@ -827,12 +827,23 @@ def stream_generate(
     kwargs["max_tokens"] = max_tokens
 
     if draft_model is None:
-        kwargs.pop("num_draft_tokens", None)
-        token_generator = generate_step(prompt, model, **kwargs)
-        # from_draft always false for non-speculative generation
-        token_generator = (
-            (token, logprobs, False) for token, logprobs in token_generator
-        )
+        # Auto-detect MTP speculative decoding: if model has MTP heads and
+        # num_draft_tokens > 0, route through speculative_generate_step.
+        _use_mtp = hasattr(model, "mtp") and kwargs.get("num_draft_tokens", 0) > 0
+        if _use_mtp:
+            kwargs.pop("max_kv_size", None)
+            kwargs.pop("prompt_progress_callback", None)
+            kwargs.pop("temp", None)
+            token_generator = speculative_generate_step(
+                prompt, model, draft_model=None, **kwargs
+            )
+        else:
+            kwargs.pop("num_draft_tokens", None)
+            token_generator = generate_step(prompt, model, **kwargs)
+            # from_draft always false for non-speculative generation
+            token_generator = (
+                (token, logprobs, False) for token, logprobs in token_generator
+            )
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
