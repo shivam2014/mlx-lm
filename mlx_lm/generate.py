@@ -655,6 +655,14 @@ def speculative_generate_step(
         draft_y = _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
 
+    # Snapshot SSM+KV states before verify for rollback on partial rejection.
+    for c in model_cache:
+        if hasattr(c, 'arm_rollback'):
+            c.arm_rollback()
+    for c in draft_cache:
+        if hasattr(c, 'arm_rollback'):
+            c.arm_rollback()
+
     ntoks = 0
     # Set these so the finally block doesn't raise
     num_draft = 0
@@ -701,8 +709,21 @@ def speculative_generate_step(
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
             _rewind_cache(num_draft, n)
+            # Restore SSM states rolled back by _rewind_cache
+            for c in model_cache:
+                if hasattr(c, 'rollback'):
+                    c.rollback()
+            for c in draft_cache:
+                if hasattr(c, 'rollback'):
+                    c.rollback()
     finally:
         _rewind_cache(num_draft, n)
+        for c in model_cache:
+            if hasattr(c, 'rollback'):
+                c.rollback()
+        for c in draft_cache:
+            if hasattr(c, 'rollback'):
+                c.rollback()
 
 
 def stream_generate(
