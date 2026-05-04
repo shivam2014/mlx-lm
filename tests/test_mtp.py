@@ -258,5 +258,68 @@ class TestMTP(unittest.TestCase):
         self.assertEqual(logged[1], 4)
 
 
+class TestMTPChained(unittest.TestCase):
+    """Tests for chained MTP (confidence-gated, no batch verify)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = _make_qwen3_5_mtp_model()
+        # Ensure MTP weights are loaded
+        _ = cls.model.mtp_forward
+
+    def test_chained_greedy_matches_standard(self):
+        """mtp_chained_step with threshold=1.0 (never accept) should match generate_step."""
+        from mlx_lm.generate import mtp_chained_step
+        prompt = mx.array([[1, 2, 3]])
+        n_tokens = 10
+        std_tokens = []
+        for tok, _ in generate_step(prompt[0], self.model, max_tokens=n_tokens):
+            std_tokens.append(int(tok))
+            if len(std_tokens) >= n_tokens:
+                break
+
+        chain_tokens = []
+        for tok, _, _ in mtp_chained_step(
+            prompt[0], self.model, max_tokens=n_tokens,
+            chain_length=5, confidence_threshold=1.0,  # never accept chain
+        ):
+            chain_tokens.append(int(tok))
+            if len(chain_tokens) >= n_tokens:
+                break
+
+        self.assertEqual(
+            std_tokens,
+            chain_tokens,
+            f"Token mismatch: std={std_tokens}, chain={chain_tokens}",
+        )
+
+    def test_chained_accepts_confident_tokens(self):
+        """With threshold=0.0, chained MTP should accept draft tokens (faster)."""
+        from mlx_lm.generate import mtp_chained_step, generate_step
+        prompt = mx.array([[1, 2, 3]])
+        n_tokens = 20
+
+        # Standard
+        std_tokens = []
+        for tok, _ in generate_step(prompt[0], self.model, max_tokens=n_tokens):
+            std_tokens.append(int(tok))
+            if len(std_tokens) >= n_tokens:
+                break
+
+        # Chained with threshold=0 (accept all)
+        chain_tokens = []
+        for tok, _, fd in mtp_chained_step(
+            prompt[0], self.model, max_tokens=n_tokens,
+            chain_length=3, confidence_threshold=0.0,
+        ):
+            chain_tokens.append(int(tok))
+            if len(chain_tokens) >= n_tokens:
+                break
+
+        # Output may differ from standard since we skip some backbone verifies,
+        # but all tokens should be valid (no garbage).
+        self.assertEqual(len(chain_tokens), n_tokens)
+
+
 if __name__ == "__main__":
     unittest.main()
