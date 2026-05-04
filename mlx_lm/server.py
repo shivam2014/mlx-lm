@@ -1959,6 +1959,43 @@ def run(
         response_generator.join()
 
 
+def build_server_parser():
+    """Build the MLX server argument parser (reusable by DFlash and other tools)."""
+    parser = argparse.ArgumentParser(description="MLX Http Server.")
+    parser.add_argument("--model", type=str, help="The path to the MLX model weights, tokenizer, and config")
+    parser.add_argument("--adapter-path", type=str, help="Optional path for the trained adapter weights and config.")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host for the HTTP server (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8080, help="Port for the HTTP server (default: 8080)")
+    parser.add_argument("--allowed-origins", type=lambda x: x.split(","), default="*", help="Allowed origins (default: *)")
+    parser.add_argument("--draft-model", type=str, help="A model to be used for speculative decoding.", default=None)
+    parser.add_argument("--num-draft-tokens", type=int, help="Number of tokens to draft when using speculative decoding.", default=3)
+    parser.add_argument("--trust-remote-code", action="store_true", help="Enable trusting remote code for tokenizer")
+    parser.add_argument("--log-level", type=str, default="INFO", choices=["DEBUG","INFO","WARNING","ERROR","CRITICAL"], help="Set the logging level (default: INFO)")
+    parser.add_argument("--chat-template", type=str, default="", help="Specify a chat template for the tokenizer")
+    parser.add_argument("--use-default-chat-template", action="store_true", help="Use the default chat template")
+    parser.add_argument("--temp", type=float, default=0.0, help="Default sampling temperature (default: 0.0)")
+    parser.add_argument("--top-p", type=float, default=1.0, help="Default nucleus sampling top-p (default: 1.0)")
+    parser.add_argument("--top-k", type=int, default=0, help="Default top-k sampling (default: 0)")
+    parser.add_argument("--min-p", type=float, default=0.0, help="Default min-p sampling (default: 0.0)")
+    parser.add_argument("--max-tokens", type=int, default=512, help="Default maximum tokens to generate (default: 512)")
+    parser.add_argument("--chat-template-args", type=json.loads, help='JSON string for apply_chat_template args', default="{}")
+    parser.add_argument("--decode-concurrency", type=int, default=32, help="Number of requests to decode in parallel")
+    parser.add_argument("--prompt-concurrency", type=int, default=8, help="Number of prompts to process in parallel")
+    parser.add_argument("--prefill-step-size", type=int, default=2048, help="Step size for prefill processing (default: 2048)")
+    parser.add_argument("--kv-bits", type=lambda s: eval(s) if s.startswith("(") else int(s), default=None, help="KV cache quantization bits")
+    parser.add_argument("--kv-group-size", type=lambda s: eval(s) if s.startswith("(") else int(s), default=64, help="KV cache quantization group size")
+    parser.add_argument("--quantized-kv-start", type=int, default=0, help="Step to start quantizing KV cache")
+    parser.add_argument("--kv-boundary-layers", type=int, default=2, help="Number of boundary KV layers")
+    parser.add_argument("--kv-boundary-bits", type=lambda s: eval(s) if s.startswith("(") else int(s), default=(8,8), help="KV boundary bits")
+    parser.add_argument("--prompt-cache-size", type=int, default=0, help="Prompt cache size")
+    parser.add_argument("--prompt-cache-bytes", type=int, default=0, help="Prompt cache bytes")
+    parser.add_argument("--context-length", type=int, default=None, help="Context length")
+    parser.add_argument("--cache-loop", action="store_true", help="Enable cache loop mode")
+    parser.add_argument("--block-ssd-cache-dir", type=str, default=None, help="Block SSD cache directory")
+    parser.add_argument("--block-ssd-cache-max-size", type=int, default=50, help="Block SSD cache max size in GB")
+    parser.add_argument("--pipeline", type=str, default=None, help="Pipeline for distributed inference")
+    return parser
+
 def main():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
