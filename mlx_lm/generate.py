@@ -568,7 +568,7 @@ def speculative_generate_step(
     prev_tokens = None
 
     # Create the KV cache for generation
-    use_mtp = draft_model is None and hasattr(model, 'mtp')
+    use_mtp = draft_model is None and hasattr(model, 'mtp') and num_draft_tokens > 0  # explicit --num-draft-tokens
     if prompt_cache is None:
         model_cache = cache.make_prompt_cache(model)
         if use_mtp:
@@ -683,8 +683,8 @@ def speculative_generate_step(
         # y is the last prompt token; run backbone one step to get hidden
         with mx.stream(generation_stream):
             # Re-use the cached mtp cache from draft_cache
-            last_token = y[-1:]
-            _, h = model(last_token[None], cache=model_cache,
+            last_token = y[-1:].reshape(1, 1)  # [1, 1] for embed_tokens(batch, seq)
+            _, h = model(last_token, cache=model_cache,
                          return_hidden=True)
             mx.eval(h)
             current_hidden = h[:, -1:, :]
@@ -828,8 +828,7 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    use_mtp = draft_model is None and hasattr(model, 'mtp')
-    if draft_model is None and not use_mtp:
+    if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
