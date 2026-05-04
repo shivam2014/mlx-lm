@@ -357,34 +357,6 @@ class ModelProvider:
                 tokenizer_config=self._tokenizer_config,
             )
 
-        # Auto-detect and inject MTP weights for speculative decoding
-        _mtp_path = Path(model_path) / "mtp_weights.safetensors"
-        if hasattr(model, "mtp") and _mtp_path.exists():
-            try:
-                _w = mx.load(str(_mtp_path))
-                _MTP_NORM_SUFFIXES = (
-                    ".input_layernorm.weight", ".post_attention_layernorm.weight",
-                    ".q_norm.weight", ".k_norm.weight",
-                    ".pre_fc_norm_hidden.weight", ".pre_fc_norm_embedding.weight",
-                    ".norm.weight",
-                )
-                def _is_norm_key(k):
-                    for s in _MTP_NORM_SUFFIXES:
-                        if k.endswith(s) or k.endswith(s.lstrip(".")):
-                            return True
-                    return False
-                for k, v in _w.items():
-                    if v.ndim == 1 and _is_norm_key(k):
-                        if v.mean().item() < 0.5:
-                            _w[k] = v + 1.0
-                model.mtp.update(tree_unflatten(list(_w.items())))
-                logging.info(
-                    "MTP speculative decoding enabled via --mtp "
-                    f"(injected {len(_w)} weights)"
-                )
-            except Exception as e:
-                logging.warning(f"MTP weight injection failed: {e}")
-
         # Use the default chat template if needed
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:

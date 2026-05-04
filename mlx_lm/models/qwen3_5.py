@@ -472,10 +472,9 @@ class TextModel(nn.Module):
         if not hasattr(self, "mtp"):
             weights = {k: v for k, v in weights.items() if "mtp." not in k}
         elif not any("mtp." in k for k in weights):
-            raise ValueError(
-                "Config specifies mtp_num_hidden_layers > 0 but the model weights "
-                "contain no MTP parameters. Set mtp_num_hidden_layers=0 to disable MTP."
-            )
+            # MTP weights are in a separate file (mtp_weights.safetensors) and
+            # will be injected by the server after load. Pass through silently.
+            weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -704,6 +703,11 @@ class Model(nn.Module):
     def make_mtp_cache(self):
         """Return fresh KVCache entries for the MTP layer(s)."""
         return self.language_model.make_mtp_cache()
+
+    @property
+    def mtp(self):
+        """Access the MTP module, creating it lazily if needed."""
+        return self.language_model.mtp
 
     @property
     def layers(self):

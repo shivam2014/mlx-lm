@@ -411,6 +411,32 @@ def load_model(
 
         model.update_modules(leaves)
 
+    # Check for separate MTP weight file (e.g. Qwen3.6 mtp_weights.safetensors)
+    _mtp_path = os.path.join(model_path, "mtp_weights.safetensors")
+    if os.path.isfile(_mtp_path) and hasattr(model, "sanitize"):
+        try:
+            _mtp_w = mx.load(_mtp_path)
+            _MTP_NORM_SUFFIXES = (
+                ".input_layernorm.weight", ".post_attention_layernorm.weight",
+                ".q_norm.weight", ".k_norm.weight",
+                ".pre_fc_norm_hidden.weight", ".pre_fc_norm_embedding.weight",
+                ".norm.weight",
+            )
+            def _is_norm_key(k):
+                for s in _MTP_NORM_SUFFIXES:
+                    if k.endswith(s) or k.endswith(s.lstrip(".")):
+                        return True
+                return False
+            for k, v in _mtp_w.items():
+                if v.ndim == 1 and _is_norm_key(k):
+                    if v.mean().item() < 0.5:
+                        _mtp_w[k] = v + 1.0
+            # MTP weights sit under language_model.mtp.* in the model
+            _mtp_w = {f"language_model.mtp.{k}": v for k, v in _mtp_w.items()}
+            weights.update(_mtp_w)
+        except Exception as e:
+            pass
+
     model.eval()
     model.load_weights(list(weights.items()), strict=strict)
 
