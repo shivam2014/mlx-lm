@@ -708,7 +708,7 @@ def speculative_generate_step(
                     mtp_logits = model.language_model.lm_head(mtp_out)
                 next_token = sampler(mtp_logits[:, -1, :])
                 ys.append(next_token)
-                last_token = next_token
+                last_token = next_token.reshape(1, 1)  # [1,1] for embed_tokens
                 current_hidden = mtp_out  # MTP hidden feeds next step
             # Trim the one-step backbone forward — it's just for hidden state
             # The verify step will process prompt+draft properly

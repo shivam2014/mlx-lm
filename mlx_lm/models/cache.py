@@ -1157,11 +1157,14 @@ class ArraysCache(_BaseCache):
         """
         self._checkpoint = list(self.cache)
 
-    def restore(self) -> None:
-        """Restore SSM+conv state from checkpoint, if one exists."""
+    def restore(self) -> bool:
+        """Restore SSM+conv state from checkpoint, if one exists.
+        Returns True if state was restored (partial rejection)."""
         if self._checkpoint is not None:
             self.cache = self._checkpoint
             self._checkpoint = None
+            return True
+        return False
 
     def trim(self, n):
         # ArraysCache stores static per-layer features with no offset.
