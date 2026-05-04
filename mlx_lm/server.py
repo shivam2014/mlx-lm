@@ -1959,6 +1959,41 @@ def run(
         response_generator.join()
 
 
+def build_server_parser():
+    """Build the MLX server argument parser (reusable by DFlash and other tools)."""
+    parser = argparse.ArgumentParser(description="MLX Http Server.")
+    # -- model
+    parser.add_argument("--model", type=str, help="The path to the MLX model weights, tokenizer, and config")
+    parser.add_argument("--adapter-path", type=str, help="Optional path for the trained adapter weights and config.")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host for the HTTP server (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8080, help="Port for the HTTP server (default: 8080)")
+    parser.add_argument("--allowed-origins", type=lambda x: x.split(","), default="*", help="Allowed origins (default: *)")
+    parser.add_argument("--draft-model", type=str, help="A model to be used for speculative decoding.", default=None)
+    parser.add_argument("--num-draft-tokens", type=int, help="Number of tokens to draft when using speculative decoding.", default=3)
+    parser.add_argument("--trust-remote-code", action="store_true", help="Enable trusting remote code for tokenizer")
+    parser.add_argument("--log-level", type=str, default="INFO", help="Log level (default: INFO)")
+    parser.add_argument("--return-log-probs", action="store_true", help="Whether or not to return log probabilities")
+    parser.add_argument("--cache-limit-gb", type=int, default=None, help="Maximum cache size in GB")
+    parser.add_argument("--max-tokens", type=int, default=2048, help="Maximum tokens to generate (default: 2048)")
+    parser.add_argument("--temp", type=float, default=0.0, help="Temperature for sampling (default: 0.0)")
+    parser.add_argument("--top-p", type=float, default=1.0, help="Top-p sampling (default: 1.0)")
+    parser.add_argument("--repetition-penalty", type=float, default=None, help="Repetition penalty")
+    parser.add_argument("--seed", type=int, default=None, help="PRNG seed")
+    parser.add_argument("--use-default-chat-template", action="store_true", help="Use default chat template")
+    parser.add_argument("--chat-template", type=str, default=None, help="Chat template file")
+    parser.add_argument("--chat-template-args", type=str, default=None, help="Chat template args (JSON)")
+    parser.add_argument("--extra-eos-token", type=str, default=(), nargs="+", help="Extra EOS tokens")
+    parser.add_argument("--kv-bits", type=str, default=None, help="KV cache quantization bits")
+    parser.add_argument("--kv-group-size", type=str, default=None, help="KV cache quantization group size")
+    parser.add_argument("--quantized-kv-start", type=int, default=0, help="Step to start quantizing KV cache")
+    parser.add_argument("--prefill-step-size", type=int, default=512, help="Prefill step size")
+    parser.add_argument("--prompt-cache-size", type=int, default=0, help="Prompt cache size")
+    parser.add_argument("--context-length", type=int, default=None, help="Context length")
+    parser.add_argument("--cache-loop", action="store_true", help="Enable cache loop mode")
+    parser.add_argument("--block-ssd-cache-dir", type=str, default=None, help="Block SSD cache directory")
+    parser.add_argument("--block-ssd-cache-max-size", type=int, default=50, help="Block SSD cache max size in GB")
+    return parser
+
 def main():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
