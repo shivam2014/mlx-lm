@@ -1,8 +1,12 @@
 # mlx-lm — Qwen 3.6 on Apple Silicon, Done Right
 
-Fork of [mlx-explore/mlx-lm](https://github.com/ml-explore/mlx-lm) focused on making
-Qwen 3.6 models (35B MoE, 27B) work reliably on M-series Macs for long-running
-agent workloads like [Hermes Agent](https://hermes-agent.nousresearch.com/).
+Fork of [mlx-explore/mlx-lm](https://github.com/ml-explore/mlx-lm) with a quantized
+KV-cache and a two-tier (RAM+SSD) prefix cache for faster long-context prefill on
+Apple Silicon.
+
+This fork focuses on making Qwen 3.6 models (35B MoE, 27B) work reliably on
+M-series Macs for long-running agent workloads like
+[Hermes Agent](https://hermes-agent.nousresearch.com/).
 
 Everything operates on the key-value cache — no model weight changes, no new
 architectures. The problem: a 35B MoE model on 64GB M1 Max uses ~25-30GB for
@@ -10,6 +14,86 @@ weights, leaving ~34GB for KV cache. A single 45K-token conversation fills
 6-8GB. Long agent sessions run out of RAM, hit swap, and everything slows down.
 
 This fork solves that from four angles.
+
+---
+
+## What I changed in this fork
+
+Everything below is this fork's work on top of
+[upstream](https://github.com/ml-explore/mlx-lm) — no model weights or
+architectures were changed.
+
+- **Quantized KV-cache (K8+V4).** Asymmetric precision: keys at 8-bit, values at
+  4-bit, with separate group sizes `(64, 32)` and the first/last 2 KV layers kept
+  at K8+V8. About 30% KV memory savings at 128K context. Based on
+  [KIVI (NeurIPS 2024)](https://arxiv.org/abs/2402.02750). Flags:
+  `--kv-bits "(8, 4)" --kv-group-size "(64, 32)" --kv-boundary-layers 2`.
+- **Two-tier prefix cache (RAM + SSD).** RAM tier is a `PromptTrie` plus an LRU
+  hot cache; SSD tier is `BlockSSDCache`, storing 256-token safetensor blocks
+  chained by `SHA256(parent_hash || model_key || block_tokens)`. Conversations
+  survive server restarts. Flags: `--block-ssd-cache-dir`,
+  `--block-ssd-cache-max-size`, `--prompt-cache-size`.
+- **Prefill reliability fixes.** Prompt-tag truncation bug, missing
+  `ArraysCache.trim()`, lost `pop_prefixes` checkpoints, a missing `max_tokens`
+  default, and a direct chat-marker boundary scan that cuts system-boundary
+  detection from ~50ms to <1ms.
+- **Cache observability.** One `PERF` line per request reports `pref_tok`,
+  `block_hit`, `block_write`, and `chain_break`, so cache regressions are
+  visible in logs.
+
+## Results
+
+Measured on Apple Silicon (M1 Max 64GB) with Qwen3.6-35B-A3B-UD-MLX-4bit and a
+29K-token Hermes agent system prompt. Full data:
+[docs/SSD_CACHE_BENCHMARK_FIX_ABC.md](docs/SSD_CACHE_BENCHMARK_FIX_ABC.md).
+
+| Result | Number |
+|--------|--------|
+| Cross-session prefill (SSD hit) | **6.7x** faster, 85.01s → 12.71s |
+| Within-session prefill (RAM trie) | **538x** faster, 0.90s, 99.9% cached |
+| Prefill throughput | 348 → **2,330** tok/s |
+| Cache hit rate | up to **99.9%** |
+
+Within-session serving reaches ~30,000 tok/s prefill. Prefill stays flat
+(~13-18s) as the prompt grows from 29K to 47K tokens, because only the new delta
+is recomputed.
+
+## Architecture
+
+```
+                    fetch_nearest_cache(model, tokens)
+                                 |
+                 +---------------+---------------+
+                 |  RAM tier (fast)              |
+                 |   PromptTrie -> LRU hot cache |
+                 |   hit: deepcopy, ~30,000 tok/s|
+                 +---------------+---------------+
+                                 | miss
+                 +---------------+---------------+
+                 |  SSD tier (persistent)        |
+                 |   BlockSSDCache               |
+                 |   256-token safetensor blocks |
+                 |   chain: SHA256(parent_hash   |
+                 |     || model_key || tokens)   |
+                 |   hit: deserialize + promote  |
+                 +-------------------------------+
+```
+
+## How to try it
+
+```bash
+mlx_lm.server \
+  --model ~/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
+  --kv-bits "(8, 4)" --kv-group-size "(64, 32)" --kv-boundary-layers 2 \
+  --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
+  --block-ssd-cache-max-size 50 \
+  --prompt-cache-size 10
+```
+
+Flags that enable the fork's work: `--kv-bits` / `--kv-group-size` /
+`--kv-boundary-layers` (quantized KV-cache), `--block-ssd-cache-dir` /
+`--block-ssd-cache-max-size` (SSD cache tier), `--prompt-cache-size` (RAM hot
+cache). Full walkthrough in [Quick Start](#quick-start).
 
 ---
 
