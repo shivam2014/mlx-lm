@@ -1,64 +1,80 @@
-# mlx-lm — Qwen 3.6 on Apple Silicon, Done Right
+<p align="center">
+  <img src="./assets/readme/hero.svg" width="100%"
+       alt="mlx-lm fork — quantized KV-cache and a two-tier prefix cache for Apple Silicon. Prefill for a 29K-token prompt on an M1 Max: 0.90s on a RAM tier hit, 12.71s on an SSD tier hit, 85.01s cold.">
+</p>
 
-Fork of [mlx-explore/mlx-lm](https://github.com/ml-explore/mlx-lm) with a quantized
-KV-cache and a two-tier (RAM+SSD) prefix cache for faster long-context prefill on
-Apple Silicon.
+# mlx-lm fork — long-context prefill on Apple Silicon
 
-This fork focuses on making Qwen 3.6 models (35B MoE, 27B) work reliably on
-M-series Macs for long-running agent workloads like
-[Hermes Agent](https://hermes-agent.nousresearch.com/).
+Fork of [ml-explore/mlx-lm](https://github.com/ml-explore/mlx-lm) adding a quantized KV-cache and a two-tier (RAM + SSD) prefix cache, aimed at running Qwen 3.6 models (35B MoE, 27B) for long agent workloads like [Hermes Agent](https://hermes-agent.nousresearch.com/) on M-series Macs.
 
-Everything operates on the key-value cache — no model weight changes, no new
-architectures. The problem: a 35B MoE model on 64GB M1 Max uses ~25-30GB for
-weights, leaving ~34GB for KV cache. A single 45K-token conversation fills
-6-8GB. Long agent sessions run out of RAM, hit swap, and everything slows down.
+Everything here operates on the key-value cache. No model weights change, and no new architectures are introduced.
 
-This fork solves that from four angles.
+**The problem.** A 35B MoE model on a 64GB M1 Max uses ~25-30GB for weights, leaving ~34GB for KV cache. One 45K-token conversation fills 6-8GB. Long agent sessions run out of RAM, hit swap, and slow to a crawl.
 
----
+## What this fork changes
 
-## What I changed in this fork
+All of the below is this fork's work on top of [upstream](https://github.com/ml-explore/mlx-lm):
 
-Everything below is this fork's work on top of
-[upstream](https://github.com/ml-explore/mlx-lm) — no model weights or
-architectures were changed.
+- **Quantized KV-cache (K8+V4).** Asymmetric precision — keys at 8-bit, values at 4-bit — with separate group sizes `(64, 32)` and the first/last 2 KV layers kept at K8+V8. About 30% KV memory savings at 128K context. Based on [KIVI (NeurIPS 2024)](https://arxiv.org/abs/2402.02750). Flags: `--kv-bits "(8, 4)" --kv-group-size "(64, 32)" --kv-boundary-layers 2`.
+- **Two-tier prefix cache (RAM + SSD).** The RAM tier is a `PromptTrie` plus an LRU hot cache; the SSD tier is `BlockSSDCache`, storing 256-token safetensor blocks chained by `SHA256(parent_hash || model_key || block_tokens)`. Conversations survive server restarts. Flags: `--block-ssd-cache-dir`, `--block-ssd-cache-max-size`, `--prompt-cache-size`.
+- **Prefill reliability fixes.** A prompt-tag truncation bug, missing `ArraysCache.trim()`, lost `pop_prefixes` checkpoints, a missing `max_tokens` default, and a direct chat-marker boundary scan that cuts system-boundary detection from ~50ms to <1ms.
+- **Cache observability.** One `PERF` line per request reports `pref_tok`, `block_hit`, `block_write`, and `chain_break`, so cache regressions are visible in logs.
 
-- **Quantized KV-cache (K8+V4).** Asymmetric precision: keys at 8-bit, values at
-  4-bit, with separate group sizes `(64, 32)` and the first/last 2 KV layers kept
-  at K8+V8. About 30% KV memory savings at 128K context. Based on
-  [KIVI (NeurIPS 2024)](https://arxiv.org/abs/2402.02750). Flags:
-  `--kv-bits "(8, 4)" --kv-group-size "(64, 32)" --kv-boundary-layers 2`.
-- **Two-tier prefix cache (RAM + SSD).** RAM tier is a `PromptTrie` plus an LRU
-  hot cache; SSD tier is `BlockSSDCache`, storing 256-token safetensor blocks
-  chained by `SHA256(parent_hash || model_key || block_tokens)`. Conversations
-  survive server restarts. Flags: `--block-ssd-cache-dir`,
-  `--block-ssd-cache-max-size`, `--prompt-cache-size`.
-- **Prefill reliability fixes.** Prompt-tag truncation bug, missing
-  `ArraysCache.trim()`, lost `pop_prefixes` checkpoints, a missing `max_tokens`
-  default, and a direct chat-marker boundary scan that cuts system-boundary
-  detection from ~50ms to <1ms.
-- **Cache observability.** One `PERF` line per request reports `pref_tok`,
-  `block_hit`, `block_write`, and `chain_break`, so cache regressions are
-  visible in logs.
+## Benchmarks
 
-## Results
+**Hardware:** M1 Max 64GB | **Model:** Qwen3.6-35B-A3B-UD-MLX-4bit | **Prompt:** 29K-token Hermes agent system prompt
 
-Measured on Apple Silicon (M1 Max 64GB) with Qwen3.6-35B-A3B-UD-MLX-4bit and a
-29K-token Hermes agent system prompt. Full data:
-[docs/SSD_CACHE_BENCHMARK_FIX_ABC.md](docs/SSD_CACHE_BENCHMARK_FIX_ABC.md).
+| | prefill | tok/s | cached |
+|---|---|---:|---:|
+| Cold (no SSD) | 85.01s | 348 | 0% |
+| SSD hit (run 2) | 12.71s | 2,330 | 89% |
+| Within-session (RAM trie) | 0.90s | 30,101 | 99.9% |
 
-| Result | Number |
-|--------|--------|
-| Cross-session prefill (SSD hit) | **6.7x** faster, 85.01s → 12.71s |
-| Within-session prefill (RAM trie) | **538x** faster, 0.90s, 99.9% cached |
-| Prefill throughput | 348 → **2,330** tok/s |
-| Cache hit rate | up to **99.9%** |
+**6.7x** cross-session prefill speedup, **538x** within-session. Within-session serving reaches ~30,000 tok/s.
 
-Within-session serving reaches ~30,000 tok/s prefill. Prefill stays flat
-(~13-18s) as the prompt grows from 29K to 47K tokens, because only the new delta
-is recomputed.
+Prefill stays flat (~13-18s) as the prompt grows from 29K to 47K tokens, because only the new delta is recomputed:
 
-## Architecture
+| prompt_tok | pref_tok | cached | chain_break | prefill |
+|---|---|---|---|---|
+| 29,629 | 3,261 | 89% | 0 | 12.78s |
+| 33,019 | 3,360 | 90% | 0 | 13.22s |
+| 39,943 | 3,318 | 92% | 0 | 15.01s |
+| 47,165 | 3,672 | 92% | 0 | 17.83s |
+| 63,297 | 302 | 99.5% | 0 | 2.20s |
+| 75,641 | 1,143 | 98.5% | 0 | 7.37s |
+
+`chain_break=0` on every request — the prompt is byte-stable across 21 requests.
+
+![SSD cache benchmark: cross-session prefill, flat prefill curve, cache hit rate, and chain stability](docs/benchmark_fix_abc.png)
+
+Full data: [docs/SSD_CACHE_BENCHMARK_FIX_ABC.md](docs/SSD_CACHE_BENCHMARK_FIX_ABC.md).
+
+## Quick start
+
+```bash
+# 1. Clone the fork
+git clone https://github.com/shivam2014/mlx-lm.git mlx-lm-vanilla
+cd mlx-lm-vanilla/mlx-lm
+
+# 2. Create virtual environment and install
+python3 -m venv venv
+source venv/bin/activate
+pip install -e .
+
+# 3. Launch the server
+mlx_lm.server \
+  --model ~/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
+  --host 127.0.0.1 --port 8000 \
+  --chat-template-args '{"enable_thinking": false}' \
+  --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
+  --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
+  --block-ssd-cache-max-size 50 \
+  --prompt-cache-size 10
+```
+
+For reasoning output, swap the template args for `'{"enable_thinking":true, "preserve_thinking": true}'` and launch via `python3 -m mlx_lm server`. See [Thinking mode](#thinking-mode) and the [recommended flags](#recommended-flags).
+
+## How the cache works
 
 ```
                     fetch_nearest_cache(model, tokens)
@@ -79,72 +95,9 @@ is recomputed.
                  +-------------------------------+
 ```
 
-## How to try it
+### KV cache quantization
 
-```bash
-mlx_lm.server \
-  --model ~/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
-  --kv-bits "(8, 4)" --kv-group-size "(64, 32)" --kv-boundary-layers 2 \
-  --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
-  --block-ssd-cache-max-size 50 \
-  --prompt-cache-size 10
-```
-
-Flags that enable the fork's work: `--kv-bits` / `--kv-group-size` /
-`--kv-boundary-layers` (quantized KV-cache), `--block-ssd-cache-dir` /
-`--block-ssd-cache-max-size` (SSD cache tier), `--prompt-cache-size` (RAM hot
-cache). Full walkthrough in [Quick Start](#quick-start).
-
----
-
-## Quick Start
-
-```bash
-# 1. Clone the fork
-git clone https://github.com/shivam2014/mlx-lm.git mlx-lm-vanilla
-cd mlx-lm-vanilla/mlx-lm
-
-# 2. Create virtual environment and install
-python3 -m venv venv
-source venv/bin/activate
-pip install -e .
-
-# 3. Launch server (no thinking)
-mlx_lm.server \
-  --model ~/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
-  --host 127.0.0.1 --port 8000 \
-  --chat-template-args '{"enable_thinking": false}' \
-  --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
-  --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
-  --block-ssd-cache-max-size 50 \
-  --prompt-cache-size 10
-
-# Or launch with thinking (model shows reasoning before answering)
-python3 -m mlx_lm server \
-  --model ~/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
-  --host 127.0.0.1 --port 8000 \
-  --chat-template-args '{"enable_thinking":true, "preserve_thinking": true}' \
-  --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
-  --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
-  --block-ssd-cache-max-size 50 \
-  --prompt-cache-size 10 
-```
----
-
-## 1. KV Cache Quantization — Fit More Context in Less RAM
-
-### The problem
-
-At FP16, each KV cache layer costs ~384MB at 128K context. With 10 KV layers
-on Qwen3.6-35B, that's ~3.8GB just for the cache. Add model weights and you're
-at 28-30GB — leaving little headroom before swap kicks in.
-
-### What this fork does
-
-Asymmetric quantization: keys at higher precision (K8), values lower (V4).
-Keys participate in the attention dot product — noise there directly shifts
-which tokens the model attends to. Values are softmax-weighted sums — a
-low-pass filter that tolerates more compression.
+At FP16, each KV cache layer costs ~384MB at 128K context. With 10 KV layers on Qwen3.6-35B, that is ~3.8GB of cache alone — on top of 28-30GB of weights, leaving little headroom before swap.
 
 ```
                     FP16    K8+V4    K8+V4 + boundary
@@ -154,100 +107,52 @@ Peak RAM           ~30 GB   ~28 GB   ~28 GB
 Headroom (64GB)    ~34 GB   ~36 GB   ~36 GB
 ```
 
-```bash
---kv-bits "(8, 4)" --kv-group-size "(64, 32)"
-```
+Asymmetric on purpose. Keys participate in the attention dot product, so noise there directly shifts which tokens the model attends to. Values are softmax-weighted sums — a low-pass filter that tolerates more compression.
 
-Boundary layers (first 2 + last 2 KV layers) stay at K8+V8 because they handle
-input embedding projection and final logit transformation where quantization
-noise compounds. Middle layers operate on already-abstracted representations
-where V4 is fine.
+Boundary layers (first 2 + last 2 KV layers) stay at K8+V8 because they handle input embedding projection and final logit transformation, where quantization noise compounds. Middle layers operate on already-abstracted representations where V4 is fine.
 
 ```bash
 --kv-boundary-layers 2 --kv-boundary-bits "(8,8)"   # default
---kv-boundary-layers 0                                # disable
+--kv-boundary-layers 0                               # disable
 ```
 
-Reference: [KIVI (NeurIPS 2024)](https://arxiv.org/abs/2402.02750).
+**Why not TurboQuant?** It compresses KV cache to ~3 bits using Walsh-Hadamard transforms. For Qwen 3.6 hybrid architectures (`full_attention_interval=4`), only 10 of 40 layers have KV caches, so the total KV cache is 1-3GB at 128K context. Moving from K8+V4 to 3-bit saves ~80MB (35B-A3B) or ~256MB (27B) — not enough to justify the WHT compute overhead. K8+V4 with boundary protection is the sweet spot for these models.
 
-### Why not TurboQuant?
+Reference: [KIVI (Liu et al., NeurIPS 2024)](https://arxiv.org/abs/2402.02750).
 
-TurboQuant compresses KV cache to ~3 bits using Walsh-Hadamard transforms.
-For Qwen 3.6 hybrid architectures (full_attention_interval=4), only 10 of 40
-layers have KV caches. At 128K context the total KV cache is 1-3GB. Moving
-from K8+V4 to TurboQuant 3-bit saves ~80MB (35B-A3B) or ~256MB (27B) — not
-enough to justify the WHT compute overhead and implementation complexity.
-K8+V4 with boundary protection is the sweet spot for these models.
+### Two-tier prefix cache
 
----
+The RAM prompt cache (`LRUPromptCache`) holds KV entries in memory. Restart the server and it is gone — every conversation starts from a full 85-second prefill.
 
-## 2. SSD Prompt Cache — Keep Conversations Alive Across Restarts
-
-### The problem
-
-The RAM prompt cache (`LRUPromptCache`) holds KV entries in memory. Restart
-the server, and the entire cache is gone. Every conversation starts from
-scratch — full 85-second prefill for a 29K-token system prompt.
-
-### What this fork does
-
-Two-tier cache with disk persistence:
-
-```
-fetch_nearest_cache(model, tokens)
-  +-- RAM tier (PromptTrie + hot cache)     → hit: deepcopy, 30,000 tok/s
-  +-- SSD tier (BlockSSDCache, 256-token blocks) → hit: deserialize + promote
-```
-
-Each 256-token block is a safetensors file on disk, chained via hash:
-`SHA256(parent_hash || model_key || block_tokens)`. On startup, the 64
-most-recent blocks are pre-loaded into an in-memory LRU hot cache (~52ms).
+The SSD tier persists each 256-token block as a safetensors file on disk, chained via hash: `SHA256(parent_hash || model_key || block_tokens)`. On startup, the 64 most-recent blocks are pre-loaded into an in-memory LRU hot cache (~52ms).
 
 ```bash
 --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache
 --block-ssd-cache-max-size 50   # GB
 ```
 
-### What it costs
+**What it cost to get right.** The initial implementation had four performance bugs that regressed prefill from ~650 tok/s to 4.5 tok/s. All are fixed:
 
-The initial implementation had 4 performance bugs that caused prefill to
-regress from ~650 tok/s to 4.5 tok/s. All fixed:
-
-| Bug | Root Cause | Fix |
+| Bug | Root cause | Fix |
 |-----|-----------|-----|
 | No hot cache | Every SSD hit read from disk | LRU `_hot_cache` in RAM |
-| Per-block mx.eval | 120 GPU sync points during prefill | Batch eval after all blocks loaded |
+| Per-block `mx.eval` | 120 GPU sync points during prefill | Batch eval after all blocks load |
 | Deep copy overhead | `copy.deepcopy()` per block per layer | Direct `mx.load()` without intermediary |
 | Eviction thrashing | `_maybe_evict()` called per block save | Deferred to post-request flush |
 
----
+## Reliability fixes
 
-## 3. Prefill Reliability — Making Caching Actually Work with Quantized KV
+Caching with asymmetric KV quantization is tricky. Several upstream issues caused silent cache corruption or missed reuse:
 
-Caching with asymmetric KV quantization is tricky. Several upstream issues
-caused silent cache corruption or missed reuse:
+- **Prompt-tag bug** — `max_tokens` truncation injected wrong tags into cached prefixes, poisoning subsequent requests (5-part fix across `_serve_single`, `_tokenize`, and segment handling).
+- **`ArraysCache` trim** — multimodal models use `ArraysCache` for non-KV layers, but `trim()` was not implemented, causing crashes on prefix trim.
+- **`pop_prefixes` checkpoints** — intermediate system/user checkpoints were lost during prefix operations, breaking the trie invariant.
+- **`max_tokens` default** — a missing `max_tokens` in the API request caused silent response truncation.
+- **Template boundary detection** — replaced the `apply_chat_template` re-encode + byte-compare in `_tokenize` with a direct token-ID scan for chat markers (`<|im_start|>` / `<|im_end|>`). Cuts system-boundary detection from ~50ms to <1ms and works for any model family with resolvable marker tokens (Qwen, Llama 3+, etc.), falling back gracefully for unknown templates.
 
-- **Prompt-tag bug** — `max_tokens` truncation injected wrong tags into cached
-  prefixes, poisoning subsequent requests (5-part fix across `_serve_single`,
-  `_tokenize`, and segment handling)
-- **ArraysCache trim** — multimodal models use `ArraysCache` for non-KV layers,
-  but `trim()` wasn't implemented, causing crashes on prefix trim
-- **pop_prefixes checkpoints** — intermediate system/user checkpoints were lost
-  during prefix operations, breaking the trie invariant
-- **max_tokens default** — missing `max_tokens` in the API request caused
-  silent response truncation
-- **Template boundary detection** — replaced the `apply_chat_template`
-  re-encode + byte-compare in `_tokenize` with a direct token-ID scan for
-  chat markers (`<|im_start|>` / `<|im_end|>`). Cuts system-boundary
-  detection from ~50ms to <1ms and works for any model family with
-  resolvable marker tokens (Qwen, Llama 3+, etc.). Falls back gracefully
-  for unknown templates.
+These fixes are what make cache hits return correct results, not just fast ones.
 
-These fixes ensure that cache hits return correct results, not just fast ones.
-
----
-
-## 4. Observability — See What the Cache Is Doing
+## Observability
 
 Every request logs a single `PERF` line with full cache health:
 
@@ -271,58 +176,9 @@ grep "PERF:" server.log | grep "chain_break=1"
 grep "PERF:" server.log | grep "pref_tok=[0-9]\{4,\}"
 ```
 
----
+## Recommended flags
 
-## Benchmarks
-
-**Hardware:** M1 Max 64GB | **Model:** Qwen3.6-35B-A3B-UD-MLX-4bit
-
-### Cross-session SSD cache (Hermes Agent, 29K-token system prompt)
-
-| | prefill | tok/s | cached |
-|---|---|---|---|
-| Cold (no SSD) | 85.01s | 348 | 0% |
-| SSD hit (Run 2) | 12.71s | 2,330 | 89% |
-| Within-session | 0.90s | 30,101 | 99.9% |
-
-**6.7x** cross-session prefill speedup. **538x** within-session.
-
-### Long conversation (21 requests, 29K → 75K tokens)
-
-| prompt_tok | pref_tok | cached | chain_break | prefill |
-|---|---|---|---|---|
-| 29,629 | 3,261 | 89% | 0 | 12.78s |
-| 33,019 | 3,360 | 90% | 0 | 13.22s |
-| 39,943 | 3,318 | 92% | 0 | 15.01s |
-| 47,165 | 3,672 | 92% | 0 | 17.83s |
-| 63,297 | 302 | 99.5% | 0 | 2.20s |
-| 75,641 | 1,143 | 98.5% | 0 | 7.37s |
-
-Prefill stays flat (~13-18s) despite prompt growing to 47K tokens.
-`chain_break=0` on every request — prompt byte-stable.
-
-![SSD Cache Benchmark Results](docs/benchmark_fix_abc.png)
-
-Full data: [docs/SSD_CACHE_BENCHMARK_FIX_ABC.md](docs/SSD_CACHE_BENCHMARK_FIX_ABC.md)
-
----
-
-## Recommended Flags
-
-These are the flags that make this fork worth using over upstream. Copy-paste
-for a production Hermes agent setup on M1 Max 64GB:
-
-```bash
-mlx_lm.server \
-  --model ~/.cache/huggingface/hub/Qwen3.6-35B-A3B-UD-MLX-4bit \
-  --host 127.0.0.1 --port 8000 \
-  --chat-template-args '{"enable_thinking": false}' \
-  --kv-bits "(8, 4)" --kv-group-size "(64, 32)" \
-  --kv-boundary-layers 2 --kv-boundary-bits "(8, 8)" \
-  --block-ssd-cache-dir ~/.cache/mlx-lm/block_ssd_cache \
-  --block-ssd-cache-max-size 50 \
-  --prompt-cache-size 10
-```
+The flags that make this fork worth using over upstream, sized for a production Hermes agent setup on M1 Max 64GB:
 
 | Flag | Value | What it does | Why you want it |
 |------|-------|-------------|-----------------|
@@ -333,11 +189,9 @@ mlx_lm.server \
 | `--block-ssd-cache-max-size` | `50` | SSD cache limit in GB | A 29K-token system prompt uses ~40GB in blocks. 50GB gives headroom for a few sessions. |
 | `--prompt-cache-size` | `10` | Keep N most-recent KV caches in RAM | Higher values use more RAM but reduce SSD round-trips. 10 is enough for typical agent sessions. |
 
+### Thinking mode
 
-### Thinking Mode
-
-For models that support reasoning (Qwen3.6‑35B‑A3B, Qwen3.5‑27B), add
-`--chat-template-args` with both flags:
+For models that support reasoning (Qwen3.6-35B-A3B, Qwen3.5-27B), add `--chat-template-args` with both flags:
 
 ```bash
 --chat-template-args '{"enable_thinking":true, "preserve_thinking": true}'
@@ -348,9 +202,7 @@ For models that support reasoning (Qwen3.6‑35B‑A3B, Qwen3.5‑27B), add
 | `enable_thinking: true` | Instructs the model to produce a `<think>...</think>` block before answering |
 | `preserve_thinking: true` | Keeps the thinking block in the response stream (instead of stripping it) |
 
-The response will include a `reasoning` field alongside `content` in the
-chat completion payload.
-
+The response will include a `reasoning` field alongside `content` in the chat completion payload.
 
 > **Debug mode** — pipe server logs to a file for post-mortem analysis:
 > ```bash
@@ -364,21 +216,12 @@ chat completion payload.
 >   --log-level DEBUG \
 >   --prompt-cache-size 10 2>&1 | tee /tmp/server_bench.log
 > ```
----
 
-## What's Next: DFlash
+## What's next: DFlash
 
-[DFlash](https://huggingface.co/collections/z-lab) models are distilled/optimized
-variants of Qwen 3.5 and 3.6, available in 27B and 35B-A3B sizes. The SSD caching
-infrastructure in this fork makes iterative testing on DFlash variants practical —
-long benchmark sessions survive server restarts without losing prefix cache.
+[DFlash](https://huggingface.co/collections/z-lab) models are distilled/optimized variants of Qwen 3.5 and 3.6, in 27B and 35B-A3B sizes. The SSD caching infrastructure here makes iterative testing on DFlash variants practical — long benchmark sessions survive server restarts without losing the prefix cache.
 
-Models in cache:
-- `Qwen3.5-27B-DFlash`
-- `Qwen3.5-35B-A3B-DFlash`
-- `Qwen3.6-35B-A3B-DFlash`
-
----
+Models in cache: `Qwen3.5-27B-DFlash`, `Qwen3.5-35B-A3B-DFlash`, `Qwen3.6-35B-A3B-DFlash`.
 
 ## Attribution
 
@@ -390,5 +233,4 @@ Models in cache:
 - [EPIC (2410.15332)](https://arxiv.org/abs/2410.15332) — position-independent caching
 - [Prompt Cache (2311.04934)](https://arxiv.org/abs/2311.04934) — modular attention reuse
 - [CacheBlend (2405.16444)](https://arxiv.org/abs/2405.16444) — selective KV recomputation
-- [Luce Org / lucebox-hub](https://github.com/Luce-Org/lucebox-hub) — prefix
-  cache boundary detection and deferred-eviction patterns
+- [Luce Org / lucebox-hub](https://github.com/Luce-Org/lucebox-hub) — prefix cache boundary detection and deferred-eviction patterns

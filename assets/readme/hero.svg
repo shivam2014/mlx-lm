@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="420" viewBox="0 0 1200 420"
+     role="img" aria-labelledby="heroTitle heroDesc">
+  <title id="heroTitle">mlx-lm fork — quantized KV-cache and a two-tier prefix cache for Apple Silicon</title>
+  <desc id="heroDesc">A fork of mlx-lm that adds a K8+V4 quantized KV-cache and a two-tier RAM plus SSD prefix cache. Measured prefill time for a 29K-token system prompt on an M1 Max 64GB: 0.90 seconds on a RAM tier hit (538x faster), 12.71 seconds on an SSD tier hit (6.7x faster), versus 85.01 seconds when recomputing from scratch.</desc>
+
+  <rect width="1200" height="420" rx="20" fill="#0D1014"/>
+
+  <g id="title-block" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <rect x="56" y="46" width="26" height="3" rx="1.5" fill="#3FD07F"/>
+    <text x="56" y="82" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+          font-size="18" letter-spacing="2.4" fill="#8B94A3">FORK OF MLX-LM &#183; APPLE SILICON</text>
+
+    <text x="56" y="158" font-size="64" font-weight="650" fill="#F0F2F5">mlx-lm</text>
+
+    <text x="56" y="206" font-size="22" fill="#F0F2F5">Quantized KV-cache and a two-tier prefix cache</text>
+    <text x="56" y="236" font-size="22" fill="#8B94A3">for 35B models on a 64 GB Mac.</text>
+
+    <text x="56" y="290" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+          font-size="18" fill="#8B94A3">K8+V4 KV-cache &#183; two-tier prefix cache</text>
+    <text x="56" y="318" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+          font-size="18" fill="#8B94A3">prefill fixes &#183; PERF telemetry</text>
+
+    <text x="56" y="382" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+          font-size="18" fill="#8B94A3">M1 Max 64GB &#183; Qwen3.6-35B-A3B-4bit &#183; 29K-token prompt</text>
+  </g>
+
+  <g id="prefill-ladder">
+    <rect x="616" y="48" width="528" height="324" rx="12" fill="#15191E" stroke="#232A32" stroke-width="1.5"/>
+    <text x="648" y="84" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+          font-size="18" letter-spacing="2" fill="#8B94A3">PREFILL &#183; 29K SYSTEM PROMPT</text>
+
+    <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+      <!-- RAM tier -->
+      <text x="648" y="136" font-size="19" fill="#F0F2F5">RAM tier hit</text>
+      <text x="1112" y="136" font-size="19" text-anchor="end" fill="#3FD07F">538&#215;</text>
+      <rect x="648" y="148" width="464" height="8" rx="4" fill="#1E242B"/>
+      <rect x="648" y="148" width="6" height="8" rx="4" fill="#3FD07F"/>
+
+      <!-- SSD tier -->
+      <text x="648" y="206" font-size="19" fill="#F0F2F5">SSD tier hit</text>
+      <text x="1112" y="206" font-size="19" text-anchor="end" fill="#3FD07F">6.7&#215;</text>
+      <rect x="648" y="218" width="464" height="8" rx="4" fill="#1E242B"/>
+      <rect x="648" y="218" width="69" height="8" rx="4" fill="#3FD07F"/>
+
+      <!-- cold -->
+      <text x="648" y="276" font-size="19" fill="#F0F2F5">cold recompute</text>
+      <text x="1112" y="276" font-size="19" text-anchor="end" fill="#8B94A3">1&#215;</text>
+      <rect x="648" y="288" width="464" height="8" rx="4" fill="#FF5A52" fill-opacity="0.75"/>
+    </g>
+
+    <text x="648" y="336" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+          font-size="18" fill="#8B94A3">prefill seconds &#183; lower is better</text>
+  </g>
+</svg>
